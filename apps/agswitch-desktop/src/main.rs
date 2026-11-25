@@ -72,8 +72,9 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let proc_adapter: Arc<dyn ProcessPort> =
-            Arc::new(sandbox::SandboxProcessAdapter::new(paths.running_state_file));
+        let proc_adapter: Arc<dyn ProcessPort> = Arc::new(sandbox::SandboxProcessAdapter::new(
+            paths.running_state_file,
+        ));
         let tx_adapter: Arc<dyn TranscriptPort> = Arc::new(sandbox::SandboxTranscriptAdapter);
         let engine = Arc::new(Engine::new(
             EngineDefaults {
@@ -113,6 +114,8 @@ fn main() -> ExitCode {
     Application::new().run(move |cx: &mut App| {
         // Initialize top Menu Bar (macOS) / System Tray (Windows) icon on main UI thread
         let tray = Rc::new(RefCell::new(TrayController::try_create()));
+        #[cfg(target_os = "windows")]
+        open_windows_keepalive_window(cx);
         let popover_slot = Rc::new(RefCell::new(PopoverSlot {
             handle: None,
             last_toggle: Instant::now()
@@ -171,6 +174,7 @@ fn main() -> ExitCode {
                         }
                         let _ = cx.update(|_cx| {
                             if let Some(t) = tray_loop.borrow_mut().as_mut() {
+                                t.sync_theme();
                                 t.sync_snapshot(&dash);
                             }
                         });
@@ -229,9 +233,8 @@ fn main() -> ExitCode {
                                 .await;
                         }
                         TrayAction::OpenProfilesFolder => {
-                            let _ = open_directory_in_file_manager(&PathBuf::from(
-                                &profiles_dir_loop,
-                            ));
+                            let _ =
+                                open_directory_in_file_manager(&PathBuf::from(&profiles_dir_loop));
                         }
                         TrayAction::Quit => {
                             let _ = cx.update(|cx| cx.quit());
@@ -347,6 +350,46 @@ fn open_popover(
     }
 }
 
+/// GPUI 0.2.2's Windows backend posts `WM_QUIT` as soon as its LAST window is destroyed
+/// (`close_one_window` -> `PostQuitMessage`), which would kill the tray app every time the popover
+/// is toggled off or dismissed with Escape. A never-shown 1x1 window keeps the event loop alive;
+/// hidden windows receive no `WM_PAINT`, so it costs no frames. "Quit AGY Swap" still exits.
+#[cfg(target_os = "windows")]
+struct KeepAliveView;
+
+#[cfg(target_os = "windows")]
+impl gpui::Render for KeepAliveView {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        gpui::div()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_keepalive_window(cx: &mut App) {
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+            point(px(0.0), px(0.0)),
+            size(px(1.0), px(1.0)),
+        ))),
+        titlebar: None,
+        window_background: WindowBackgroundAppearance::Transparent,
+        kind: WindowKind::PopUp,
+        focus: false,
+        show: false,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        ..WindowOptions::default()
+    };
+    if let Err(err) = cx.open_window(options, |_window, cx| cx.new(|_cx| KeepAliveView)) {
+        eprintln!("failed to open keep-alive window: {err}");
+    }
+}
+
 fn read_initial_compact_pref(ui_prefs_path: &PathBuf) -> bool {
     std::fs::read_to_string(ui_prefs_path)
         .ok()
@@ -355,7 +398,7 @@ fn read_initial_compact_pref(ui_prefs_path: &PathBuf) -> bool {
         .unwrap_or(false)
 }
 
-/// Position popover centered directly beneath the macOS Menu Bar icon (or top-right fallback on startup).
+/// Position popover beneath the macOS Menu Bar icon, or above the Windows tray icon (DPI-aware).
 fn compute_popover_bounds(
     cx: &App,
     anchor: Option<TrayAnchorRect>,
@@ -383,9 +426,41 @@ fn compute_popover_bounds(
         (0.0, 0.0, 1440.0, 900.0)
     };
 
-    let mut origin_x = disp_x + disp_w - pop_w - 14.0;
-    let mut origin_y = if cfg!(target_os = "windows") {
-        (disp_y + disp_h - pop_h - 54.0).max(disp_y + 12.0)
+    let (origin_x, origin_y) = popover_origin(
+        anchor,
+        (disp_x, disp_y, disp_w, disp_h),
+        (pop_w, pop_h),
+        cfg!(target_os = "windows"),
+    );
+
+    Bounds::new(
+        point(px(origin_x), px(origin_y)),
+        size(px(pop_w), px(pop_h)),
+    )
+}
+
+/// Popover origin in logical px for a given display `(x, y, w, h)` and popover size.
+///
+/// On Windows the popover opens ABOVE a bottom taskbar, but GPUI's `Window::resize` keeps the
+/// top-left corner fixed and there is no move API. Since the view resizes Compact <-> Full on
+/// layout toggles and page navigation, Windows positions the window by the FULL-size slot so a
+/// later grow never extends past the right or bottom screen edge.
+fn popover_origin(
+    anchor: Option<TrayAnchorRect>,
+    disp: (f32, f32, f32, f32),
+    pop: (f32, f32),
+    is_windows: bool,
+) -> (f32, f32) {
+    let (disp_x, disp_y, disp_w, disp_h) = disp;
+    let (slot_w, slot_h) = if is_windows {
+        (pop.0.max(FULL_POPOVER_W), pop.1.max(FULL_POPOVER_H))
+    } else {
+        pop
+    };
+
+    let mut origin_x = disp_x + disp_w - slot_w - 14.0;
+    let mut origin_y = if is_windows {
+        (disp_y + disp_h - slot_h - 54.0).max(disp_y + 12.0)
     } else {
         disp_y + 34.0
     };
@@ -395,28 +470,75 @@ fn compute_popover_bounds(
         && rect.height > 1.0
         && (rect.x > 1.0 || rect.y > 1.0)
     {
-        // tray-icon returns physical pixels on macOS Retina (menu bar height >= 42px physical -> 2x)
-        let scale = if rect.height >= 42.0 || rect.x > f64::from(disp_w) {
-            2.0_f64
+        if is_windows {
+            (origin_x, origin_y) = windows_anchor_origin(rect, disp, slot_w, slot_h);
         } else {
-            1.0_f64
-        };
-        let logical_cx = f64_to_f32((rect.x + rect.width * 0.5) / scale);
-        let logical_bottom = f64_to_f32((rect.y + rect.height) / scale);
-
-        origin_x = logical_cx - pop_w * 0.5;
-        if cfg!(target_os = "windows") {
-            origin_y = (disp_y + disp_h - pop_h - 54.0).max(disp_y + 12.0);
-        } else {
+            // tray-icon returns physical pixels on macOS Retina (menu bar height >= 42px physical -> 2x)
+            let scale = if rect.height >= 42.0 || rect.x > f64::from(disp_w) {
+                2.0_f64
+            } else {
+                1.0_f64
+            };
+            let logical_cx = f64_to_f32((rect.x + rect.width * 0.5) / scale);
+            let logical_bottom = f64_to_f32((rect.y + rect.height) / scale);
+            origin_x = logical_cx - slot_w * 0.5;
             origin_y = (logical_bottom + 6.0).clamp(disp_y + 28.0, disp_y + 46.0);
         }
     }
 
     let min_x = disp_x + 10.0;
-    let max_x = (disp_x + disp_w - pop_w - 10.0).max(min_x);
-    origin_x = origin_x.clamp(min_x, max_x);
+    let max_x = (disp_x + disp_w - slot_w - 10.0).max(min_x);
+    let min_y = disp_y + 8.0;
+    let max_y = (disp_y + disp_h - slot_h - 8.0).max(min_y);
+    (origin_x.clamp(min_x, max_x), origin_y.clamp(min_y, max_y))
+}
 
-    Bounds::new(point(px(origin_x), px(origin_y)), size(px(pop_w), px(pop_h)))
+/// Infer the primary monitor's DPI scale on Windows from the tray icon's PHYSICAL rect.
+///
+/// GPUI reports display bounds in logical pixels (physical / scale) while `tray-icon` reports
+/// `Shell_NotifyIconGetRect` in physical pixels, and GPUI exposes no scale factor before a window
+/// exists. The notification area always lives on the primary monitor's taskbar (origin `0,0`)
+/// docked to a screen edge, so the icon's far edge / logical display extent approximates the
+/// scale; it is snapped to Windows' 25% DPI steps (100%, 125%, 150%, 175%, ...).
+fn estimate_windows_tray_scale(rect: TrayAnchorRect, disp: (f32, f32, f32, f32)) -> f64 {
+    let (disp_x, disp_y, disp_w, disp_h) = disp;
+    let logical_right = f64::from(disp_x + disp_w);
+    let logical_bottom = f64::from(disp_y + disp_h);
+    if logical_right <= 1.0 || logical_bottom <= 1.0 {
+        return 1.0;
+    }
+    let ratio_bottom = (rect.y + rect.height) / logical_bottom;
+    let ratio_right = (rect.x + rect.width) / logical_right;
+    let raw = ratio_bottom.max(ratio_right);
+    if !raw.is_finite() || raw < 0.9 {
+        // Taskbar docked top/left (Windows 10 only): the ratio carries no scale information.
+        return 1.0;
+    }
+    ((raw * 4.0).round() / 4.0).clamp(1.0, 4.0)
+}
+
+/// Windows popover origin (logical px): horizontally centered on the tray icon, opening above a
+/// bottom taskbar (or below a top one). The caller clamps the result fully on-screen.
+fn windows_anchor_origin(
+    rect: TrayAnchorRect,
+    disp: (f32, f32, f32, f32),
+    pop_w: f32,
+    pop_h: f32,
+) -> (f32, f32) {
+    let (_, disp_y, _, disp_h) = disp;
+    let scale = estimate_windows_tray_scale(rect, disp);
+    let logical_cx = f64_to_f32((rect.x + rect.width * 0.5) / scale);
+    let logical_top = f64_to_f32(rect.y / scale);
+    let logical_bottom = f64_to_f32((rect.y + rect.height) / scale);
+    let icon_mid_y = (logical_top + logical_bottom) * 0.5;
+
+    let origin_x = logical_cx - pop_w * 0.5;
+    let origin_y = if icon_mid_y >= disp_y + disp_h * 0.5 {
+        logical_top - pop_h - 8.0
+    } else {
+        logical_bottom + 8.0
+    };
+    (origin_x, origin_y)
 }
 
 /// Safe `f64 -> f32` screen coordinate conversion without `as` casts.
@@ -438,4 +560,110 @@ fn f64_to_f32(val: f64) -> f32 {
     let mag = f32::from(u16::try_from(tenths / 10).unwrap_or(u16::MAX))
         + f32::from(u8::try_from(tenths % 10).unwrap_or(0)) * 0.1;
     if negative { -mag } else { mag }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Win11 tray icon rect (physical px) for a 1920x1080 panel at a given DPI scale.
+    fn win11_icon(scale: f64) -> TrayAnchorRect {
+        TrayAnchorRect {
+            x: 1920.0 - 260.0 * scale,
+            y: 1080.0 - 44.0 * scale,
+            width: 24.0 * scale,
+            height: 40.0 * scale,
+        }
+    }
+
+    fn display_at(scale: f32) -> (f32, f32, f32, f32) {
+        (0.0, 0.0, 1920.0 / scale, 1080.0 / scale)
+    }
+
+    #[test]
+    fn windows_scale_inferred_across_common_dpi_steps() {
+        for (scale, expected) in [
+            (1.0_f32, 1.0_f64),
+            (1.25, 1.25),
+            (1.5, 1.5),
+            (1.75, 1.75),
+            (2.0, 2.0),
+        ] {
+            let got = estimate_windows_tray_scale(win11_icon(f64::from(scale)), display_at(scale));
+            assert!(
+                (got - expected).abs() < f64::EPSILON,
+                "scale {scale}: got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_popover_stays_on_screen_and_above_taskbar() {
+        for scale in [1.0_f32, 1.25, 1.5, 1.75, 2.0] {
+            let disp = display_at(scale);
+            let (_, _, disp_w, disp_h) = disp;
+            for (pop_w, pop_h) in [
+                (FULL_POPOVER_W, FULL_POPOVER_H),
+                (COMPACT_POPOVER_W, COMPACT_POPOVER_H),
+            ] {
+                let icon = win11_icon(f64::from(scale));
+                let (x, y) = windows_anchor_origin(icon, disp, pop_w, pop_h);
+                let icon_top_logical = f64_to_f32(icon.y / f64::from(scale));
+                // Same clamping as `compute_popover_bounds`.
+                let clamped_x = x.clamp(10.0, (disp_w - pop_w - 10.0).max(10.0));
+                let clamped_y = y.clamp(8.0, (disp_h - pop_h - 8.0).max(8.0));
+                assert!(
+                    clamped_x >= 0.0 && clamped_x + pop_w <= disp_w,
+                    "scale {scale}: x={clamped_x}"
+                );
+                assert!(clamped_y >= 0.0, "scale {scale}: y={clamped_y}");
+                // Whenever the panel fits above the tray icon it opens there, never over the taskbar.
+                if pop_h + 16.0 <= icon_top_logical {
+                    assert!(
+                        clamped_y + pop_h <= icon_top_logical,
+                        "scale {scale}: y={clamped_y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn windows_compact_popover_can_grow_to_full_without_leaving_screen() {
+        for scale in [1.0_f32, 1.25, 1.5, 1.75, 2.0] {
+            let disp = display_at(scale);
+            let (_, _, disp_w, disp_h) = disp;
+            for anchor in [Some(win11_icon(f64::from(scale))), None] {
+                let (x, y) = popover_origin(
+                    anchor,
+                    disp,
+                    (COMPACT_POPOVER_W, COMPACT_POPOVER_H),
+                    true,
+                );
+                // Navigating to Settings / toggling Full resizes from the fixed top-left corner.
+                assert!(x >= 0.0 && x + FULL_POPOVER_W <= disp_w, "scale {scale}: x={x}");
+                if FULL_POPOVER_H + 16.0 <= disp_h {
+                    assert!(y >= 0.0 && y + FULL_POPOVER_H <= disp_h, "scale {scale}: y={y}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_windows_origin_is_unchanged_menu_bar_drop_down() {
+        let (_, y) = popover_origin(None, (0.0, 0.0, 1512.0, 982.0), (FULL_POPOVER_W, FULL_POPOVER_H), false);
+        assert!((y - 34.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn windows_scale_falls_back_for_top_docked_taskbar() {
+        let icon = TrayAnchorRect {
+            x: 1500.0,
+            y: 2.0,
+            width: 24.0,
+            height: 36.0,
+        };
+        let got = estimate_windows_tray_scale(icon, display_at(1.0));
+        assert!((got - 1.0).abs() < f64::EPSILON);
+    }
 }

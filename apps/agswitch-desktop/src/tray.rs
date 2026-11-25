@@ -41,12 +41,15 @@ pub enum TrayAction {
 pub struct TrayController {
     tray: TrayIcon,
     last_signature: String,
+    /// Windows only: whether the taskbar currently uses the light theme (glyph drawn dark).
+    light_taskbar: bool,
 }
 
 impl TrayController {
     /// Must be called on the main UI thread after the native application event loop initializes.
     pub fn try_create() -> Option<Self> {
-        let icon = build_embedded_icon()?;
+        let light_taskbar = taskbar_uses_light_theme();
+        let icon = build_embedded_icon(light_taskbar)?;
         let menu = build_menu(None);
         let builder = TrayIconBuilder::new()
             .with_tooltip("AGY Swap — Antigravity Account Swapper")
@@ -63,6 +66,7 @@ impl TrayController {
         Some(Self {
             tray,
             last_signature: String::new(),
+            light_taskbar,
         })
     }
 
@@ -73,6 +77,19 @@ impl TrayController {
             return None;
         }
         Some(r)
+    }
+
+    /// Re-tint the tray glyph when the Windows taskbar switches between light and dark themes
+    /// (macOS template icons are tinted by the system automatically).
+    pub fn sync_theme(&mut self) {
+        let light = taskbar_uses_light_theme();
+        if light == self.light_taskbar {
+            return;
+        }
+        self.light_taskbar = light;
+        if let Some(icon) = build_embedded_icon(light) {
+            let _ = self.tray.set_icon(Some(icon));
+        }
     }
 
     pub fn sync_snapshot(&mut self, snap: &DashboardSnapshot) {
@@ -199,8 +216,28 @@ fn build_menu(snap: Option<&DashboardSnapshot>) -> Menu {
     menu
 }
 
+/// Windows 10/11 taskbar theme (`SystemUsesLightTheme`), read through the safe registry API.
+#[cfg(target_os = "windows")]
+fn taskbar_uses_light_theme() -> bool {
+    windows_registry::CURRENT_USER
+        .open(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        .and_then(|key| key.get_u32("SystemUsesLightTheme"))
+        .is_ok_and(|v| v == 1)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn taskbar_uses_light_theme() -> bool {
+    false
+}
+
 /// Draw a crisp 22x22 RGBA orbital gauge mark in memory for macOS Menu Bar & Windows Tray.
-fn build_embedded_icon() -> Option<Icon> {
+/// White glyph for dark taskbars / macOS templates, near-black glyph for light Windows taskbars.
+fn build_embedded_icon(dark_glyph: bool) -> Option<Icon> {
+    let (r, g, b, a) = if dark_glyph {
+        (26_u8, 26_u8, 26_u8, 240_u8)
+    } else {
+        (255_u8, 255_u8, 255_u8, 245_u8)
+    };
     const SIZE: u32 = 22;
     let mut rgba = vec![0_u8; usize::try_from(SIZE * SIZE * 4).ok()?];
 
@@ -217,10 +254,10 @@ fn build_embedded_icon() -> Option<Icon> {
             if on_outer_ring || on_center_dot || on_orbit_dot {
                 let idx = usize::try_from((y * SIZE + x) * 4).ok()?;
                 if let Some(slice) = rgba.get_mut(idx..idx + 4) {
-                    slice[0] = 255;
-                    slice[1] = 255;
-                    slice[2] = 255;
-                    slice[3] = 245;
+                    slice[0] = r;
+                    slice[1] = g;
+                    slice[2] = b;
+                    slice[3] = a;
                 }
             }
         }
