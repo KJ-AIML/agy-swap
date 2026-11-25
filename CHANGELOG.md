@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Windows
+- **Hide to tray (`×`)**: The borderless Windows popover has no system minimize or close buttons, so a `×` button next to Quit (`⏻`) now hides the popover while AGY Swap keeps running in the System Tray. Left-click the tray icon to bring it back.
+
 ## [0.1.0] — Initial Cross-Platform Release
 
 ### Highlights
