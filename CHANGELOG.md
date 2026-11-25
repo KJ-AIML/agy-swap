@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.1] — Windows Hide to Tray
+
+### Windows
+- **Hide to tray (`×`)**: The borderless Windows popover has no system minimize or close buttons, so a `×` button next to Quit (`⏻`) now hides the popover while AGY Swap keeps running in the System Tray. Left-click the tray icon to bring it back.
+
+### Release Artifacts
+- **Windows 10/11 (x86_64):** `AGY-Swap-v0.1.1-windows-x86_64.zip` (`sha256: d4b0fa6629c06c165bdda458e833b8b8dbd9cff3aa1f00d12a51816af6d7d4f2`) + `SHA256SUMS-windows-x86_64.txt`
+- **macOS:** no changes in this release. `v0.1.0` remains the current macOS build.
+
 ## [0.1.0] — Initial Cross-Platform Release
 
 ### Highlights

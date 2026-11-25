@@ -109,7 +109,7 @@ cd agy-swap
 ./scripts/package-macos.sh --install
 ```
 
-This compiles `--release` with thin LTO, bundles `AGY Swap.app` (`LSUIElement = true` so it lives cleanly in the Menu Bar with no Dock clutter), builds `dist/AGY-Swap-v0.1.0-macos-arm64.dmg`, signs ad hoc, and installs both `/Applications/AGY Swap.app` and `~/.local/bin/agswitch`.
+This compiles `--release` with thin LTO, bundles `AGY Swap.app` (`LSUIElement = true` so it lives cleanly in the Menu Bar with no Dock clutter), builds `dist/AGY-Swap-v<version>-macos-arm64.dmg`, signs ad hoc, and installs both `/Applications/AGY Swap.app` and `~/.local/bin/agswitch`.
 
 To run straight from source without installing:
 ```sh
@@ -121,10 +121,10 @@ cargo run -p agswitch-desktop -- --sandbox       # isolated sandbox (never touch
 
 Requires Windows 10/11 (`x86_64`).
 
-**Pre-built:** download `AGY-Swap-v0.1.0-windows-x86_64.zip` from [GitHub Releases](https://github.com/KJ-AIML/agy-swap/releases), check it against `SHA256SUMS-windows-x86_64.txt`, extract it anywhere, and run `AGY Swap\agswitch-desktop.exe`. The app lives in the System Tray (on Windows 11, new tray icons start in the `^` overflow; drag it onto the taskbar to pin it). `AGY Swap\agswitch.exe` is the CLI.
+**Pre-built:** download `AGY-Swap-v0.1.1-windows-x86_64.zip` from [GitHub Releases](https://github.com/KJ-AIML/agy-swap/releases), check it against `SHA256SUMS-windows-x86_64.txt`, extract it anywhere, and run `AGY Swap\agswitch-desktop.exe`. The app lives in the System Tray (on Windows 11, new tray icons start in the `^` overflow; drag it onto the taskbar to pin it). `AGY Swap\agswitch.exe` is the CLI.
 
 ```powershell
-(Get-FileHash .\AGY-Swap-v0.1.0-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+(Get-FileHash .\AGY-Swap-v0.1.1-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
 Get-Content .\SHA256SUMS-windows-x86_64.txt
 ```
 
@@ -136,7 +136,7 @@ cd agy-swap
 .\scripts\package-windows.ps1 -Install
 ```
 
-This compiles `--release` with thin LTO, embeds the app icon and version info, builds `dist\AGY-Swap-v0.1.0-windows-x86_64.zip` plus `dist\SHA256SUMS-windows-x86_64.txt`, and (with `-Install`) installs to `%LOCALAPPDATA%\Programs\AGY Swap\` with a Start Menu shortcut. No Administrator rights are needed. Omit `-Install` to only build the zip. If script execution is disabled, run `powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1`.
+This compiles `--release` with thin LTO, embeds the app icon and version info, builds `dist\AGY-Swap-v<version>-windows-x86_64.zip` plus `dist\SHA256SUMS-windows-x86_64.txt`, and (with `-Install`) installs to `%LOCALAPPDATA%\Programs\AGY Swap\` with a Start Menu shortcut. No Administrator rights are needed. Omit `-Install` to only build the zip. If script execution is disabled, run `powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1`.
 
 To run straight from source without installing:
 ```powershell

@@ -997,7 +997,36 @@ impl AgSwitchView {
                         );
                     }))
                     .child("↻"),
-            )
+            );
+
+        // Windows: the borderless tray popover has no system caption buttons, so offer an
+        // explicit "hide to tray" (×) next to Quit (⏻). The app keeps running in the System Tray;
+        // left-click the tray icon to bring the popover back.
+        if cfg!(target_os = "windows") {
+            right_bar = right_bar.child(
+                div()
+                    .id("hdr-hide")
+                    .w(px(26.0))
+                    .h(px(26.0))
+                    .rounded(px(999.0))
+                    .bg(p.btn_dark)
+                    .border_1()
+                    .border_color(p.border_hairline)
+                    .text_size(px(15.0))
+                    .text_color(p.text_secondary)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(p.text_primary))
+                    .on_click(cx.listener(|v, _, window, _cx| {
+                        v.dismiss_popover(window);
+                    }))
+                    .child("×"),
+            );
+        }
+
+        right_bar = right_bar
             .child(
                 div()
                     .id("hdr-quit")
