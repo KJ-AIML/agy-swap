@@ -7,7 +7,9 @@ use std::sync::Mutex;
 use std::time::{Duration as StdDuration, SystemTime};
 
 use agswitch_engine::domain;
-use agswitch_engine::spec::{AccountProfile, LaunchSpec, RunningInstance, TranscriptFeed, TranscriptStep};
+use agswitch_engine::spec::{
+    AccountProfile, LaunchSpec, RunningInstance, TranscriptFeed, TranscriptStep,
+};
 use agswitch_engine::{BoxFut, ClockPort, ProcessPort, TranscriptPort, WorkspaceLinkPort};
 use agswitch_primitives::{AppError, RuntimeOs};
 use chrono::{DateTime, Duration, Utc};
@@ -55,8 +57,7 @@ pub fn default_antigravity_bin_path() -> String {
             return system_app.to_string_lossy().into_owned();
         }
         if let Some(home) = dirs::home_dir() {
-            let user_app =
-                home.join("Applications/Antigravity.app/Contents/MacOS/Antigravity");
+            let user_app = home.join("Applications/Antigravity.app/Contents/MacOS/Antigravity");
             if user_app.exists() {
                 return user_app.to_string_lossy().into_owned();
             }
@@ -66,19 +67,45 @@ pub fn default_antigravity_bin_path() -> String {
 
     #[cfg(target_os = "windows")]
     {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
-            .join("Programs")
-            .join("antigravity")
-            .join("Antigravity.exe")
-            .to_string_lossy()
-            .into_owned()
+        let candidates = windows_antigravity_candidates();
+        candidates
+            .iter()
+            .find(|p| p.is_file())
+            .or_else(|| candidates.first())
+            .map_or_else(
+                || r"C:\Program Files\Antigravity\Antigravity.exe".to_owned(),
+                |p| p.to_string_lossy().into_owned(),
+            )
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         "/usr/bin/antigravity".to_owned()
     }
+}
+
+/// Known per-user and machine-wide Antigravity install locations on Windows, in priority order.
+#[cfg(target_os = "windows")]
+fn windows_antigravity_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(local) = dirs::data_local_dir() {
+        let programs = local.join("Programs");
+        out.push(programs.join("Antigravity").join("Antigravity.exe"));
+        out.push(programs.join("Antigravity IDE").join("Antigravity.exe"));
+        out.push(local.join("Antigravity").join("Antigravity.exe"));
+    }
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(pf) = std::env::var(var)
+            && !pf.trim().is_empty()
+        {
+            out.push(
+                PathBuf::from(pf)
+                    .join("Antigravity")
+                    .join("Antigravity.exe"),
+            );
+        }
+    }
+    out
 }
 
 /// Resolve primary OS user home directory.
@@ -181,6 +208,8 @@ impl OsProcessAdapter {
         {
             let _ = hidden_command("taskkill.exe")
                 .args(["/PID", &pid.to_string(), "/T"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status();
         }
         #[cfg(not(target_os = "windows"))]
@@ -198,6 +227,8 @@ impl OsProcessAdapter {
         {
             let _ = hidden_command("taskkill.exe")
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status();
         }
         #[cfg(not(target_os = "windows"))]
@@ -332,6 +363,16 @@ impl ProcessPort for OsProcessAdapter {
             cmd.env(k, v);
         }
 
+        #[cfg(target_os = "windows")]
+        {
+            // Fully detach Antigravity from AGY Swap / the CLI console: no inherited console,
+            // and its own process group so Ctrl+C in a terminal never propagates to it.
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        }
+
         cmd.spawn()
             .map_err(|e| AppError::Integration(format!("failed to launch Antigravity: {e}")))?;
         Ok(())
@@ -354,11 +395,14 @@ impl ProcessPort for OsProcessAdapter {
 
         #[cfg(target_os = "windows")]
         {
+            // `AppActivate` returns a bool; surface it via the exit code (PowerShell exits 0 otherwise).
             let script = format!(
-                "(New-Object -ComObject WScript.Shell).AppActivate({pid})"
+                "if ((New-Object -ComObject WScript.Shell).AppActivate({pid})) {{ exit 0 }} else {{ exit 1 }}"
             );
             let status = hidden_command("powershell.exe")
                 .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status()
                 .map_err(|e| AppError::Integration(format!("powershell focus failed: {e}")))?;
             Ok(status.success())
@@ -398,7 +442,7 @@ impl OsWorkspaceLinkAdapter {
         {
             use std::os::windows::fs::MetadataExt;
             const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-            return (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+            (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -429,6 +473,8 @@ impl OsWorkspaceLinkAdapter {
                 .args(["/c", "mklink", "/J"])
                 .arg(link_path)
                 .arg(target_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .output()
                 .map_err(|e| {
                     AppError::Integration(format!("failed to invoke mklink ({args}): {e}"))
@@ -454,25 +500,17 @@ impl OsWorkspaceLinkAdapter {
 
         #[cfg(target_os = "windows")]
         {
-            // `rmdir` without `/s` removes ONLY the NTFS junction reparse point, never target files.
-            let output = hidden_command("cmd.exe")
-                .args(["/c", "rmdir"])
-                .arg(link_path)
-                .output()
+            // `fs::remove_dir` (`RemoveDirectoryW`) on an NTFS junction / directory symlink deletes
+            // ONLY the reparse point and never recurses into the target. File symlinks need
+            // `remove_file` instead.
+            fs::remove_dir(link_path)
+                .or_else(|_| fs::remove_file(link_path))
                 .map_err(|e| {
                     AppError::Integration(format!(
                         "failed to remove junction '{}': {e}",
                         link_path.display()
                     ))
-                })?;
-            if !output.status.success() {
-                let err = String::from_utf8_lossy(&output.stderr);
-                return Err(AppError::Integration(format!(
-                    "rmdir junction failed for '{}': {err}",
-                    link_path.display()
-                )));
-            }
-            Ok(())
+                })
         }
     }
 
@@ -500,7 +538,8 @@ impl OsWorkspaceLinkAdapter {
     fn rescue_standalone_conversations(src_ag: &Path, dst_ag: &Path) {
         let src_conv = src_ag.join("conversations");
         let dst_conv = dst_ag.join("conversations");
-        if src_conv.is_dir() && fs::create_dir_all(&dst_conv).is_ok()
+        if src_conv.is_dir()
+            && fs::create_dir_all(&dst_conv).is_ok()
             && let Ok(entries) = fs::read_dir(&src_conv)
         {
             for entry in entries.flatten() {
@@ -516,7 +555,8 @@ impl OsWorkspaceLinkAdapter {
 
         let src_brain = src_ag.join("brain");
         let dst_brain = dst_ag.join("brain");
-        if src_brain.is_dir() && fs::create_dir_all(&dst_brain).is_ok()
+        if src_brain.is_dir()
+            && fs::create_dir_all(&dst_brain).is_ok()
             && let Ok(entries) = fs::read_dir(&src_brain)
         {
             for entry in entries.flatten() {
@@ -827,10 +867,7 @@ fn hidden_command(program: &str) -> Command {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut cmd = Command::new(program);
-    cmd.creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    cmd.creation_flags(CREATE_NO_WINDOW).stdin(Stdio::null());
     cmd
 }
 
@@ -840,8 +877,11 @@ pub fn open_directory_in_file_manager(dir: &Path) -> Result<(), AppError> {
         .map_err(|e| AppError::Integration(format!("create folder failed: {e}")))?;
     #[cfg(target_os = "macos")]
     let res = Command::new("open").arg(dir).spawn();
+    // Explorer silently falls back to "Documents" when handed forward slashes.
     #[cfg(target_os = "windows")]
-    let res = Command::new("explorer.exe").arg(dir).spawn();
+    let res = Command::new("explorer.exe")
+        .arg(dir.to_string_lossy().replace('/', "\\"))
+        .spawn();
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let res = Command::new("xdg-open").arg(dir).spawn();
 
@@ -929,7 +969,8 @@ pub mod sandbox {
             let fake_home_str = fake_home.to_string_lossy();
             let runtime_os = RuntimeOs::current();
             for p in [&primary, &trade, &work] {
-                let marker = PathBuf::from(domain::oauth_marker_path(p, &fake_home_str, runtime_os));
+                let marker =
+                    PathBuf::from(domain::oauth_marker_path(p, &fake_home_str, runtime_os));
                 if let Some(parent) = marker.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
@@ -1276,6 +1317,60 @@ mod tests {
             .map_err(|e| e.to_string())?;
         assert!(!vault_root.exists());
         assert!(precious_chat.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn os_workspace_links_with_spaces_toggle_and_preserve_target() -> Result<(), String> {
+        let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let primary_home = tmp.path().join("Name With Space");
+        let vault_root = tmp.path().join("Profiles Dir").join("Work Acc");
+
+        let primary_skills = primary_home.join(".gemini").join("skills");
+        fs::create_dir_all(&primary_skills).map_err(|e| e.to_string())?;
+        let precious_skill = primary_skills.join("my skill.md");
+        fs::write(&precious_skill, "keep me").map_err(|e| e.to_string())?;
+
+        let adapter = OsWorkspaceLinkAdapter::new(primary_home);
+        let profile = AccountProfile::create_isolated(
+            AccountId::new("work-acc").map_err(|e| e.to_string())?,
+            "Work Acc".to_owned(),
+            String::new(),
+            "#6FD8EE".to_owned(),
+            vault_root.to_string_lossy().into_owned(),
+        );
+
+        adapter
+            .enable_shared_mode(&profile)
+            .map_err(|e| e.to_string())?;
+        assert!(adapter.is_shared_mode_enabled(&profile));
+        // The link resolves to the primary folder contents.
+        let via_link = vault_root
+            .join(".gemini")
+            .join("skills")
+            .join("my skill.md");
+        assert_eq!(
+            fs::read_to_string(&via_link).map_err(|e| e.to_string())?,
+            "keep me"
+        );
+
+        // Disabling removes only the links and recreates empty standalone folders.
+        adapter
+            .disable_shared_mode(&profile)
+            .map_err(|e| e.to_string())?;
+        assert!(!adapter.is_shared_mode_enabled(&profile));
+        assert!(!via_link.exists());
+        assert!(precious_skill.exists());
+
+        // Re-enable is idempotent, and safe deletion still preserves the primary target.
+        adapter
+            .enable_shared_mode(&profile)
+            .map_err(|e| e.to_string())?;
+        adapter
+            .delete_vault_directory_safely(&profile.root_path)
+            .map_err(|e| e.to_string())?;
+        assert!(!vault_root.exists());
+        assert!(precious_skill.exists());
         Ok(())
     }
 }

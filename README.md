@@ -38,7 +38,7 @@ Built with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) a
 - **Optional Shared Chats & Skills.** Toggle **Shared Chats** per secondary profile to link `.gemini/{antigravity, config, skills}` to your primary profile via POSIX symlinks (macOS) or NTFS directory junctions (Windows), while keeping login vaults and `UserData` strictly isolated.
 - **Custom PHOSPHOR LED Orbs per profile.** Pick from 12 GPU-rendered dot-matrix animations (`Analysing`, `Orbital`, `Equalizer`, `Pulse`, `Radar`, `Verified`, …) across 5 phosphor themes per account — or leave on `Auto Status`.
 - **Full or Compact layout + Dark & Light themes.** Switch live between **Full (2-Column)** (`680×524`) and **Compact (Switcher Only)** (`320×420`), **Samo Obsidian (Dark)** and **Samo Alabaster (Light)**, plus a one-click **Hide Emails** privacy toggle for screen sharing.
-- **Safe Sandbox Mode.** Test every UI page, CLI command, and rotation flow without touching your live Antigravity session via `--sandbox` and `./scripts/test-safe.sh`.
+- **Safe Sandbox Mode.** Test every UI page, CLI command, and rotation flow without touching your live Antigravity session via `--sandbox` and `./scripts/test-safe.sh` (macOS) or `.\scripts\test-safe.ps1` (Windows).
 
 <table>
   <tr>
@@ -119,14 +119,41 @@ cargo run -p agswitch-desktop -- --sandbox       # isolated sandbox (never touch
 
 ### Windows
 
-> Windows native packaging & verification is tracked in the Windows build issue. You can build and run directly from source today on Windows 10/11 (MSVC Rust toolchain + Visual Studio Build Tools):
+Requires Windows 10/11 (`x86_64`).
+
+**Pre-built:** download `AGY-Swap-v0.1.0-windows-x86_64.zip` from [GitHub Releases](https://github.com/KJ-AIML/agy-swap/releases), check it against `SHA256SUMS-windows-x86_64.txt`, extract it anywhere, and run `AGY Swap\agswitch-desktop.exe`. The app lives in the System Tray (on Windows 11, new tray icons start in the `^` overflow; drag it onto the taskbar to pin it). `AGY Swap\agswitch.exe` is the CLI.
+
+```powershell
+(Get-FileHash .\AGY-Swap-v0.1.0-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+Get-Content .\SHA256SUMS-windows-x86_64.txt
+```
+
+**From source:** requires Visual Studio Build Tools (Desktop development with C++ + Windows SDK) and [rustup](https://rustup.rs) (MSVC toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml)).
 
 ```powershell
 git clone https://github.com/KJ-AIML/agy-swap.git
 cd agy-swap
-cargo run -p xtask -- verify
-cargo run --release -p agswitch-desktop
+.\scripts\package-windows.ps1 -Install
 ```
+
+This compiles `--release` with thin LTO, embeds the app icon and version info, builds `dist\AGY-Swap-v0.1.0-windows-x86_64.zip` plus `dist\SHA256SUMS-windows-x86_64.txt`, and (with `-Install`) installs to `%LOCALAPPDATA%\Programs\AGY Swap\` with a Start Menu shortcut. No Administrator rights are needed. Omit `-Install` to only build the zip. If script execution is disabled, run `powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1`.
+
+To run straight from source without installing:
+```powershell
+cargo run --release -p agswitch-desktop          # live mode
+cargo run -p agswitch-desktop -- --sandbox       # isolated sandbox (never touches live Antigravity)
+```
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/media/windows-overview-dark.png" alt="AGY Swap on Windows 11 in Dark mode, anchored above the System Tray"></td>
+    <td width="50%"><img src="docs/media/windows-overview-light.png" alt="AGY Swap on Windows 11 in Light mode"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Windows 11 — Dark</b> · DirectX GPUI popover above the tray</sub></td>
+    <td align="center"><sub><b>Windows 11 — Light</b> · sandbox demo data</sub></td>
+  </tr>
+</table>
 
 ## CLI
 
@@ -159,7 +186,8 @@ AGY Swap enforces five non-negotiable engine rules (`R1`–`R5`), verified autom
 
 ```sh
 # Full safe verification: layer DAG + purity + clippy (-D warnings) + unit tests + 10 sandbox E2E checks
-./scripts/test-safe.sh
+./scripts/test-safe.sh          # macOS
+.\scripts\test-safe.ps1         # Windows (PowerShell)
 
 # Architectural & lint gates only
 cargo run -p xtask -- verify
