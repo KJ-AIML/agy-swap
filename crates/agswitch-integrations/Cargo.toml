@@ -1,0 +1,21 @@
+[package]
+name = "agswitch-integrations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agswitch-primitives.workspace = true
+agswitch-engine.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+serde_json.workspace = true
+sysinfo.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,4 @@
+avoid-breaking-exported-api = false
+allow-unwrap-in-tests = false
+allow-expect-in-tests = false
+allow-panic-in-tests = false

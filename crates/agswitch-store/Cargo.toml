@@ -1,0 +1,20 @@
+[package]
+name = "agswitch-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agswitch-primitives.workspace = true
+agswitch-spec.workspace = true
+agswitch-domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+chrono.workspace = true
+
+[lints]
+workspace = true

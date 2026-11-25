@@ -1,0 +1,59 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/agswitch-primitives",
+  "crates/agswitch-spec",
+  "crates/agswitch-domain",
+  "crates/agswitch-store",
+  "crates/agswitch-engine",
+  "crates/agswitch-integrations",
+  "apps/agswitch-cli",
+  "apps/agswitch-desktop",
+  "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.99"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+dbg_macro = "deny"
+as_conversions = "deny"
+
+[workspace.dependencies]
+agswitch-primitives = { path = "crates/agswitch-primitives" }
+agswitch-spec = { path = "crates/agswitch-spec" }
+agswitch-domain = { path = "crates/agswitch-domain" }
+agswitch-store = { path = "crates/agswitch-store" }
+agswitch-engine = { path = "crates/agswitch-engine" }
+agswitch-integrations = { path = "crates/agswitch-integrations" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process"] }
+dirs = "7"
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+clap = { version = "4", features = ["derive"] }
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+tray-icon = { version = "0.26", default-features = false }
+cargo_metadata = "0.19"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+opt-level = 3

@@ -1,0 +1,1179 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use agswitch_primitives::{AccountTier, AppError, ModelFamily, RuleId, RuntimeOs};
+use agswitch_spec::{
+    AccountProfile, AccountUsageMetrics, ActiveSessionSpan, LaunchSpec, ModelUsageBreakdown,
+    RuleStatus, SingleModelUsage, TranscriptFeed, TranscriptStep, UsageLedger, UsageSnapshot,
+};
+use chrono::{DateTime, Duration, Utc};
+
+pub const MOCK_SSH_CONNECTION: &str = "127.0.0.1 1234 127.0.0.1 22";
+pub const CONTEXT_SOFT_BUDGET: u64 = 1_000_000;
+pub const COOLDOWN_HOURS: i64 = 5;
+pub const ACCENT_PALETTE: [&str; 6] = [
+    "#6FD8EE", "#9FC8FF", "#34D399", "#FFC48A", "#FF9F88", "#C4B5FD",
+];
+
+pub const SHARED_GEMINI_FOLDERS: [&str; 3] = ["antigravity", "config", "skills"];
+
+/// Normalize a filesystem path for cross-platform case-aware/insensitive matching.
+pub fn normalize_path(path: &str) -> String {
+    let trimmed = path.trim().trim_matches('"').trim_matches('\'');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut normalized = trimmed.replace('\\', "/");
+    while normalized.len() > 1 && normalized.ends_with('/') {
+        // Keep Windows drive root like `C:/` intact
+        if normalized.len() == 3 && normalized.as_bytes().get(1) == Some(&b':') {
+            break;
+        }
+        normalized.pop();
+    }
+    normalized
+}
+
+/// Join path segments using the target OS separator without touching host `std::fs`.
+pub fn join_os_path(base: &str, segments: &[&str], os: RuntimeOs) -> String {
+    let sep = match os {
+        RuntimeOs::Windows => "\\",
+        RuntimeOs::MacOs | RuntimeOs::Linux => "/",
+    };
+    let mut out = base
+        .trim_end_matches(['/', '\\'])
+        .replace(if os == RuntimeOs::Windows { '/' } else { '\\' }, sep);
+    for seg in segments {
+        let clean = seg.trim_matches(['/', '\\']);
+        if clean.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(sep);
+        }
+        out.push_str(clean);
+    }
+    out
+}
+
+/// Compute `UserData` directory for an isolated profile.
+pub fn user_data_dir(profile: &AccountProfile, os: RuntimeOs) -> Option<String> {
+    if profile.is_default_profile || profile.root_path.trim().is_empty() {
+        return None;
+    }
+    Some(join_os_path(&profile.root_path, &["UserData"], os))
+}
+
+/// Compute OAuth marker file path (for existence-only auth check under Rule R2).
+pub fn oauth_marker_path(profile: &AccountProfile, primary_home: &str, os: RuntimeOs) -> String {
+    let base = if profile.is_default_profile {
+        primary_home
+    } else {
+        profile.root_path.as_str()
+    };
+    join_os_path(base, &[".gemini", "jetski-standalone-oauth-token"], os)
+}
+
+/// Compute installation marker path for the primary profile fallback check.
+pub fn primary_install_marker_path(primary_home: &str, os: RuntimeOs) -> String {
+    join_os_path(primary_home, &[".gemini", "antigravity", "installation_id"], os)
+}
+
+/// Determine whether a process command line belongs to a child/helper/sidecar rather than the main UI instance.
+pub fn is_child_process(command_line: &str) -> bool {
+    if command_line.trim().is_empty() {
+        return false;
+    }
+    let lower = command_line.to_ascii_lowercase();
+    lower.contains("--type=")
+        || lower.contains("--import=")
+        || lower.contains("sidecar_sdk")
+        || lower.contains("sidecars/")
+        || lower.contains("sidecars\\")
+        || lower.contains(".cjs")
+        || lower.contains(".mjs")
+        || lower.contains("antigravity helper")
+        || lower.contains("crashpad")
+}
+
+/// Extract `--user-data-dir=...` or `--user-data-dir ...` from a command line.
+/// Handles `--user-data-dir="/path with spaces"`, `"--user-data-dir=/path with spaces"`,
+/// `--user-data-dir "/path with spaces"`, and unquoted paths.
+pub fn extract_user_data_dir(command_line: &str) -> Option<String> {
+    let lower = command_line.to_ascii_lowercase();
+    let flag = "--user-data-dir";
+    let start = lower.find(flag)?;
+    let enclosing_quote = if start > 0 {
+        match command_line.as_bytes().get(start - 1) {
+            Some(b'"') => Some('"'),
+            Some(b'\'') => Some('\''),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let rest = command_line.get(start + flag.len()..)?;
+    let rest = rest.trim_start();
+
+    let after_sep = if let Some(eq_rest) = rest.strip_prefix('=') {
+        eq_rest.trim_start()
+    } else {
+        rest
+    };
+
+    if after_sep.is_empty() {
+        return None;
+    }
+
+    let raw_val = if let Some(quoted) = after_sep.strip_prefix('"') {
+        quoted.split('"').next().unwrap_or_default()
+    } else if let Some(quoted) = after_sep.strip_prefix('\'') {
+        quoted.split('\'').next().unwrap_or_default()
+    } else if let Some(q) = enclosing_quote {
+        after_sep.split(q).next().unwrap_or_default()
+    } else {
+        after_sep.split_whitespace().next().unwrap_or_default()
+    };
+
+    let norm = normalize_path(raw_val);
+    if norm.is_empty() { None } else { Some(norm) }
+}
+
+/// Match a running Antigravity main instance command line to a configured profile id.
+pub fn match_profile_id(command_line: &str, profiles: &[AccountProfile], os: RuntimeOs) -> String {
+    let Some(extracted) = extract_user_data_dir(command_line) else {
+        return profiles
+            .iter()
+            .find(|p| p.is_default_profile)
+            .map_or_else(|| "default".to_owned(), |p| p.id.as_str().to_owned());
+    };
+
+    let norm_extracted = normalize_path(&extracted);
+    for profile in profiles.iter().filter(|p| !p.is_default_profile) {
+        if let Some(ud) = user_data_dir(profile, os)
+            && normalize_path(&ud).eq_ignore_ascii_case(&norm_extracted)
+        {
+            return profile.id.as_str().to_owned();
+        }
+    }
+
+    format!("untracked:{norm_extracted}")
+}
+
+/// Build an OS-appropriate isolated `LaunchSpec` without touching the host OS.
+pub fn build_launch_spec(
+    profile: &AccountProfile,
+    antigravity_bin_path: &str,
+    os: RuntimeOs,
+) -> LaunchSpec {
+    if profile.is_default_profile {
+        return LaunchSpec {
+            exe_path: antigravity_bin_path.to_owned(),
+            arguments: Vec::new(),
+            env_overrides: BTreeMap::new(),
+            env_removals: vec!["SSH_CONNECTION".to_owned()],
+            dirs_to_ensure: Vec::new(),
+        };
+    }
+
+    let root = join_os_path(&profile.root_path, &[], os);
+    let user_data = join_os_path(&root, &["UserData"], os);
+    let mut env = BTreeMap::new();
+    env.insert("SSH_CONNECTION".to_owned(), MOCK_SSH_CONNECTION.to_owned());
+
+    let dirs = match os {
+        RuntimeOs::Windows => {
+            let roaming = join_os_path(&root, &["AppData", "Roaming"], os);
+            let local = join_os_path(&root, &["AppData", "Local"], os);
+            env.insert("USERPROFILE".to_owned(), root.clone());
+            env.insert("APPDATA".to_owned(), roaming.clone());
+            env.insert("LOCALAPPDATA".to_owned(), local.clone());
+            vec![root, roaming, local, user_data.clone()]
+        }
+        RuntimeOs::MacOs | RuntimeOs::Linux => {
+            let xdg_config = join_os_path(&root, &[".config"], os);
+            let xdg_data = join_os_path(&root, &[".local", "share"], os);
+            let gemini_dir = join_os_path(&root, &[".gemini"], os);
+            env.insert("HOME".to_owned(), root.clone());
+            env.insert("XDG_CONFIG_HOME".to_owned(), xdg_config.clone());
+            env.insert("XDG_DATA_HOME".to_owned(), xdg_data.clone());
+            vec![root, xdg_config, xdg_data, gemini_dir, user_data.clone()]
+        }
+    };
+
+    LaunchSpec {
+        exe_path: antigravity_bin_path.to_owned(),
+        arguments: vec![format!("--user-data-dir={user_data}")],
+        env_overrides: env,
+        env_removals: Vec::new(),
+        dirs_to_ensure: dirs,
+    }
+}
+
+/// Generate a unique URL/slug-safe profile ID.
+pub fn slugify(raw: &str, existing_ids: &[String]) -> String {
+    let existing_lower: BTreeSet<String> = existing_ids
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    let mut base = String::new();
+    let mut prev_dash = false;
+    for ch in raw.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            base.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !base.is_empty() {
+            base.push('-');
+            prev_dash = true;
+        }
+    }
+    let mut base = base.trim_matches('-').to_owned();
+    if base.is_empty() || base.eq_ignore_ascii_case("default") {
+        base = "account".to_owned();
+    }
+
+    let mut candidate = base.clone();
+    let mut counter: u32 = 2;
+    while existing_lower.contains(&candidate) {
+        candidate = format!("{base}-{counter}");
+        counter = counter.saturating_add(1);
+    }
+    candidate
+}
+
+/// Sanitize a display name into a cross-platform safe folder name.
+pub fn sanitize_folder_name(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.');
+    if trimmed.is_empty() {
+        "Profile".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Choose the next ready profile in rotation, skipping profiles currently in 5h cooldown.
+pub fn choose_next_profile<'a>(
+    profiles: &'a [AccountProfile],
+    running_ids: &BTreeSet<String>,
+    last_active_id: Option<&str>,
+    cooldown_ids: &BTreeSet<String>,
+) -> Result<&'a AccountProfile, AppError> {
+    if profiles.is_empty() {
+        return Err(AppError::Validation("no profiles configured".to_owned()));
+    }
+    if profiles.len() == 1 {
+        return profiles
+            .first()
+            .ok_or_else(|| AppError::Validation("no profiles configured".to_owned()));
+    }
+
+    let running_lower: BTreeSet<String> =
+        running_ids.iter().map(|s| s.to_ascii_lowercase()).collect();
+    let cooldown_lower: BTreeSet<String> = cooldown_ids
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+
+    let mut anchor: Option<usize> = None;
+
+    if let Some(last_id) = last_active_id
+        && running_lower.contains(&last_id.to_ascii_lowercase())
+    {
+        anchor = profiles.iter().position(|p| p.id.eq_ignore_case(last_id));
+    }
+
+    if anchor.is_none() && !running_lower.is_empty() {
+        anchor = profiles
+            .iter()
+            .position(|p| running_lower.contains(&p.id.as_str().to_ascii_lowercase()));
+    }
+
+    if anchor.is_none()
+        && let Some(last_id) = last_active_id
+    {
+        anchor = profiles.iter().position(|p| p.id.eq_ignore_case(last_id));
+    }
+
+    let anchor_idx = anchor.unwrap_or(0);
+    let len = profiles.len();
+
+    if !cooldown_lower.is_empty() {
+        for offset in 1..=len {
+            let idx = (anchor_idx + offset) % len;
+            if let Some(candidate) = profiles.get(idx)
+                && !cooldown_lower.contains(&candidate.id.as_str().to_ascii_lowercase())
+            {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    let next_idx = (anchor_idx + 1) % len;
+    profiles
+        .get(next_idx)
+        .ok_or_else(|| AppError::Validation("failed to select next profile".to_owned()))
+}
+
+/// Record active profile heartbeat spans into the usage ledger.
+pub fn record_active_heartbeat(
+    ledger: &mut UsageLedger,
+    active_ids: &[String],
+    now: DateTime<Utc>,
+) -> bool {
+    let mut changed = false;
+    let mut seen = BTreeSet::new();
+
+    for id in active_ids {
+        let lower = id.to_ascii_lowercase();
+        if !seen.insert(lower) {
+            continue;
+        }
+        let existing_idx = ledger
+            .intervals
+            .iter()
+            .rposition(|span| span.profile_id.eq_ignore_ascii_case(id));
+
+        if let Some(idx) = existing_idx
+            && let Some(span) = ledger.intervals.get_mut(idx)
+            && now >= span.start_utc
+            && (now - span.end_utc) <= Duration::minutes(40)
+        {
+            if now > span.end_utc {
+                span.end_utc = now;
+                changed = true;
+            }
+            continue;
+        }
+
+        ledger.intervals.push(ActiveSessionSpan {
+            profile_id: id.clone(),
+            start_utc: now,
+            end_utc: now,
+        });
+        changed = true;
+    }
+
+    let cutoff = now - Duration::days(8);
+    let before = ledger.intervals.len();
+    ledger.intervals.retain(|s| s.end_utc >= cutoff);
+    if ledger.intervals.len() != before {
+        changed = true;
+    }
+
+    changed
+}
+
+/// Active cooldown profile IDs at `now`.
+pub fn active_cooldown_ids(ledger: &UsageLedger, now: DateTime<Utc>) -> BTreeSet<String> {
+    ledger
+        .cooldown_until_utc
+        .iter()
+        .filter(|(_, until)| **until > now)
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+/// Toggle a 5-hour cooldown for `profile_id`. Returns `true` if now on cooldown.
+pub fn toggle_cooldown_5h(ledger: &mut UsageLedger, profile_id: &str, now: DateTime<Utc>) -> bool {
+    let is_active = ledger
+        .cooldown_until_utc
+        .get(profile_id)
+        .is_some_and(|until| *until > now);
+
+    if is_active {
+        ledger.cooldown_until_utc.remove(profile_id);
+        false
+    } else {
+        ledger
+            .cooldown_until_utc
+            .insert(profile_id.to_owned(), now + Duration::hours(COOLDOWN_HOURS));
+        true
+    }
+}
+
+/// Resolve tier badge from explicit override or display name heuristic.
+pub fn resolve_tier(profile: &AccountProfile, ledger: &UsageLedger) -> AccountTier {
+    if let Some(tier) = ledger.tier_overrides.get(profile.id.as_str()) {
+        return *tier;
+    }
+    if profile.display_name.to_ascii_lowercase().contains("ultra") {
+        AccountTier::Ultra
+    } else {
+        AccountTier::Pro
+    }
+}
+
+/// Parse one line from `transcript.jsonl` safely, ignoring malformed or unrelated entries.
+pub fn parse_transcript_line(line: &str, fallback_ts: DateTime<Utc>) -> Option<TranscriptStep> {
+    if line.trim().is_empty() {
+        return None;
+    }
+    if !line.contains("\"USER_INPUT\"") && !line.contains("\"PLANNER_RESPONSE\"") {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_str(line).ok()?;
+    let event_type = val.get("type")?.as_str()?;
+    let timestamp_utc = val
+        .get("created_at")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map_or(fallback_ts, |dt| dt.with_timezone(&Utc));
+
+    match event_type {
+        "USER_INPUT" => Some(TranscriptStep {
+            timestamp_utc,
+            is_user_turn: true,
+            model: None,
+            input_tokens: 0,
+            cache_read_tokens: 0,
+            output_tokens: 0,
+        }),
+        "PLANNER_RESPONSE" => {
+            let model = val
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            let input_tokens = val
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let cache_read_tokens = val
+                .get("cache_read_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let output_tokens = val
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            Some(TranscriptStep {
+                timestamp_utc,
+                is_user_turn: false,
+                model,
+                input_tokens,
+                cache_read_tokens,
+                output_tokens,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Attribute a shared-transcript step timestamp to a profile via recorded heartbeat intervals.
+pub fn attribute_timestamp<'a>(
+    intervals: &'a [ActiveSessionSpan],
+    ts: DateTime<Utc>,
+    fallback: &'a str,
+) -> &'a str {
+    for span in intervals.iter().rev() {
+        if ts >= span.start_utc && ts <= span.end_utc {
+            return span.profile_id.as_str();
+        }
+    }
+    let grace = Duration::minutes(2);
+    for span in intervals.iter().rev() {
+        if ts >= span.start_utc - grace && ts <= span.end_utc + grace {
+            return span.profile_id.as_str();
+        }
+    }
+    fallback
+}
+
+/// Compute complete usage telemetry (5h, 24h, Weekly 7d, and per-model breakdown) purely from loaded feeds.
+pub fn compute_usage_snapshot(
+    profiles: &[AccountProfile],
+    ledger: &UsageLedger,
+    feeds: &[TranscriptFeed],
+    now: DateTime<Utc>,
+) -> UsageSnapshot {
+    #[derive(Default)]
+    struct Acc {
+        turns_5h: u32,
+        steps_5h: u32,
+        tokens_5h: u64,
+        output_tokens_5h: u64,
+        tokens_24h: u64,
+        turns_7d: u32,
+        steps_7d: u32,
+        tokens_7d: u64,
+        models: ModelUsageBreakdown,
+        oldest_5h_utc: Option<DateTime<Utc>>,
+        oldest_gemini_5h_utc: Option<DateTime<Utc>>,
+        oldest_claude_gpt_5h_utc: Option<DateTime<Utc>>,
+    }
+
+    let cutoff_5h = now - Duration::hours(5);
+    let cutoff_24h = now - Duration::hours(24);
+    let cutoff_7d = now - Duration::days(7);
+    let default_id = profiles
+        .iter()
+        .find(|p| p.is_default_profile)
+        .or_else(|| profiles.first())
+        .map_or("default", |p| p.id.as_str());
+
+    let mut accs: BTreeMap<String, Acc> = profiles
+        .iter()
+        .map(|p| (p.id.as_str().to_owned(), Acc::default()))
+        .collect();
+
+    let mut total_tokens_24h: u64 = 0;
+    let mut total_turns_24h: u32 = 0;
+    let mut total_tokens_7d: u64 = 0;
+    let mut total_turns_7d: u32 = 0;
+    let mut global_models = ModelUsageBreakdown::default();
+    let mut active_context_tokens: u64 = 0;
+    let mut active_cache_hit_percent: f64 = 0.0;
+    let mut newest_mtime: Option<DateTime<Utc>> = None;
+
+    for feed in feeds {
+        let is_newer = newest_mtime.is_none_or(|prev| feed.last_write_utc > prev);
+        if is_newer && !feed.steps.is_empty() {
+            let last_model = feed.steps.iter().rev().find(|s| {
+                !s.is_user_turn && (s.input_tokens + s.cache_read_tokens + s.output_tokens) > 0
+            });
+            if let Some(lm) = last_model {
+                newest_mtime = Some(feed.last_write_utc);
+                active_context_tokens = lm
+                    .input_tokens
+                    .saturating_add(lm.cache_read_tokens)
+                    .saturating_add(lm.output_tokens);
+                let prompt_tok: u64 = feed
+                    .steps
+                    .iter()
+                    .filter(|s| !s.is_user_turn)
+                    .map(|s| s.input_tokens.saturating_add(s.cache_read_tokens))
+                    .sum();
+                let cache_tok: u64 = feed
+                    .steps
+                    .iter()
+                    .filter(|s| !s.is_user_turn)
+                    .map(|s| s.cache_read_tokens)
+                    .sum();
+                active_cache_hit_percent = ratio_percent_u64(cache_tok, prompt_tok);
+            }
+        }
+
+        for step in &feed.steps {
+            if step.timestamp_utc < cutoff_7d {
+                continue;
+            }
+            let owner = feed
+                .fixed_owner_profile_id
+                .as_deref()
+                .unwrap_or_else(|| {
+                    attribute_timestamp(&ledger.intervals, step.timestamp_utc, default_id)
+                });
+
+            let acc = if accs.contains_key(owner) {
+                accs.get_mut(owner)
+            } else {
+                accs.get_mut(default_id)
+            };
+            let Some(acc) = acc else {
+                continue;
+            };
+
+            let step_total = step
+                .input_tokens
+                .saturating_add(step.cache_read_tokens)
+                .saturating_add(step.output_tokens);
+
+            if step.is_user_turn {
+                total_turns_7d = total_turns_7d.saturating_add(1);
+                acc.turns_7d = acc.turns_7d.saturating_add(1);
+                if step.timestamp_utc >= cutoff_24h {
+                    total_turns_24h = total_turns_24h.saturating_add(1);
+                }
+                if step.timestamp_utc >= cutoff_5h {
+                    acc.turns_5h = acc.turns_5h.saturating_add(1);
+                    update_oldest(&mut acc.oldest_5h_utc, step.timestamp_utc);
+                }
+            } else {
+                let family = ModelFamily::classify(step.model.as_deref());
+                let in_5h = step.timestamp_utc >= cutoff_5h;
+
+                acc.steps_7d = acc.steps_7d.saturating_add(1);
+                acc.tokens_7d = acc.tokens_7d.saturating_add(step_total);
+                total_tokens_7d = total_tokens_7d.saturating_add(step_total);
+                add_model_usage(
+                    &mut acc.models,
+                    step.model.as_deref(),
+                    family,
+                    in_5h,
+                    step_total,
+                );
+                add_model_usage(
+                    &mut global_models,
+                    step.model.as_deref(),
+                    family,
+                    in_5h,
+                    step_total,
+                );
+
+                if step.timestamp_utc >= cutoff_24h {
+                    acc.tokens_24h = acc.tokens_24h.saturating_add(step_total);
+                    total_tokens_24h = total_tokens_24h.saturating_add(step_total);
+                }
+                if in_5h {
+                    acc.steps_5h = acc.steps_5h.saturating_add(1);
+                    acc.tokens_5h = acc.tokens_5h.saturating_add(step_total);
+                    acc.output_tokens_5h = acc.output_tokens_5h.saturating_add(step.output_tokens);
+                    update_oldest(&mut acc.oldest_5h_utc, step.timestamp_utc);
+                    match family {
+                        ModelFamily::Gemini => {
+                            update_oldest(&mut acc.oldest_gemini_5h_utc, step.timestamp_utc);
+                        }
+                        ModelFamily::Claude | ModelFamily::Gpt => {
+                            update_oldest(&mut acc.oldest_claude_gpt_5h_utc, step.timestamp_utc);
+                        }
+                        ModelFamily::Other => {}
+                    }
+                }
+            }
+        }
+    }
+
+    let mut by_profile_id = BTreeMap::new();
+    for profile in profiles {
+        let id = profile.id.as_str();
+        let acc = accs.get(id);
+        let tier = resolve_tier(profile, ledger);
+        let budget_5h = tier.steps_5h_budget();
+        let budget_7d = tier.steps_7d_budget();
+
+        let cooldown_until = ledger.cooldown_until_utc.get(id).copied();
+        let is_on_cooldown = cooldown_until.is_some_and(|u| u > now);
+
+        let reset_in_secs = if let Some(until) = cooldown_until
+            && until > now
+        {
+            u64::try_from((until - now).num_seconds()).ok()
+        } else if let Some(oldest) = acc.and_then(|a| a.oldest_5h_utc) {
+            let window_end = oldest + Duration::hours(5);
+            if window_end > now {
+                u64::try_from((window_end - now).num_seconds()).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let steps_5h = acc.map_or(0, |a| a.steps_5h);
+        let steps_7d = acc.map_or(0, |a| a.steps_7d);
+        let load_percent_5h = if is_on_cooldown {
+            100.0
+        } else {
+            let raw = (f64::from(steps_5h) / f64::from(budget_5h)) * 100.0;
+            ((raw * 10.0).round() / 10.0).min(99.0)
+        };
+        let load_percent_7d = {
+            let raw = (f64::from(steps_7d) / f64::from(budget_7d)) * 100.0;
+            ((raw * 10.0).round() / 10.0).min(100.0)
+        };
+
+        let mut models = acc.map_or_else(ModelUsageBreakdown::default, |a| a.models.clone());
+        let cg_budget_5h = tier.claude_gpt_5h_budget();
+        let cg_budget_7d = tier.claude_gpt_7d_budget();
+        let cg_5h = models.claude_calls_5h.saturating_add(models.gpt_calls_5h);
+        let cg_7d = models.claude_calls_7d.saturating_add(models.gpt_calls_7d);
+
+        models.gemini_remaining_5h_pct = if is_on_cooldown {
+            0.0
+        } else {
+            remaining_percent_u32(models.gemini_calls_5h, budget_5h)
+        };
+        models.gemini_remaining_7d_pct = remaining_percent_u32(models.gemini_calls_7d, budget_7d);
+        models.claude_gpt_remaining_5h_pct = if is_on_cooldown {
+            0.0
+        } else {
+            remaining_percent_u32(cg_5h, cg_budget_5h)
+        };
+        models.claude_gpt_remaining_7d_pct = remaining_percent_u32(cg_7d, cg_budget_7d);
+        let g_reset_secs = window_reset_secs(
+            cooldown_until,
+            acc.and_then(|a| a.oldest_gemini_5h_utc),
+            now,
+        );
+        let cg_reset_secs = window_reset_secs(
+            cooldown_until,
+            acc.and_then(|a| a.oldest_claude_gpt_5h_utc),
+            now,
+        );
+        models.gemini_reset_5h_secs = g_reset_secs;
+        models.claude_gpt_reset_5h_secs = cg_reset_secs;
+        models.gemini_reset_5h_label = format_reset_secs(g_reset_secs);
+        models.claude_gpt_reset_5h_label = format_reset_secs(cg_reset_secs);
+
+        by_profile_id.insert(
+            id.to_owned(),
+            AccountUsageMetrics {
+                profile_id: id.to_owned(),
+                tier,
+                turns_5h: acc.map_or(0, |a| a.turns_5h),
+                steps_5h,
+                tokens_5h: acc.map_or(0, |a| a.tokens_5h),
+                output_tokens_5h: acc.map_or(0, |a| a.output_tokens_5h),
+                tokens_24h: acc.map_or(0, |a| a.tokens_24h),
+                turns_7d: acc.map_or(0, |a| a.turns_7d),
+                steps_7d,
+                tokens_7d: acc.map_or(0, |a| a.tokens_7d),
+                load_percent_5h,
+                load_percent_7d,
+                models,
+                is_on_cooldown,
+                reset_in_secs,
+            },
+        );
+    }
+
+    let active_context_budget_percent =
+        ratio_percent_u64(active_context_tokens, CONTEXT_SOFT_BUDGET).min(100.0);
+
+    UsageSnapshot {
+        by_profile_id,
+        total_tokens_24h,
+        total_turns_24h,
+        total_tokens_7d,
+        total_turns_7d,
+        models_7d: global_models,
+        active_context_tokens,
+        active_context_budget_percent,
+        active_cache_hit_percent,
+    }
+}
+
+fn add_model_usage(
+    target: &mut ModelUsageBreakdown,
+    raw_model: Option<&str>,
+    family: ModelFamily,
+    in_5h: bool,
+    tokens: u64,
+) {
+    match family {
+        ModelFamily::Gemini => {
+            target.gemini_calls_7d = target.gemini_calls_7d.saturating_add(1);
+            target.gemini_tokens_7d = target.gemini_tokens_7d.saturating_add(tokens);
+            if in_5h {
+                target.gemini_calls_5h = target.gemini_calls_5h.saturating_add(1);
+            }
+        }
+        ModelFamily::Claude => {
+            target.claude_calls_7d = target.claude_calls_7d.saturating_add(1);
+            target.claude_tokens_7d = target.claude_tokens_7d.saturating_add(tokens);
+            if in_5h {
+                target.claude_calls_5h = target.claude_calls_5h.saturating_add(1);
+            }
+        }
+        ModelFamily::Gpt => {
+            target.gpt_calls_7d = target.gpt_calls_7d.saturating_add(1);
+            target.gpt_tokens_7d = target.gpt_tokens_7d.saturating_add(tokens);
+            if in_5h {
+                target.gpt_calls_5h = target.gpt_calls_5h.saturating_add(1);
+            }
+        }
+        ModelFamily::Other => {}
+    }
+
+    let model_name = raw_model
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown");
+    let entry = target
+        .by_model
+        .entry(model_name.to_owned())
+        .or_insert_with(|| SingleModelUsage {
+            model_name: model_name.to_owned(),
+            family,
+            calls_5h: 0,
+            tokens_5h: 0,
+            calls_7d: 0,
+            tokens_7d: 0,
+        });
+    entry.calls_7d = entry.calls_7d.saturating_add(1);
+    entry.tokens_7d = entry.tokens_7d.saturating_add(tokens);
+    if in_5h {
+        entry.calls_5h = entry.calls_5h.saturating_add(1);
+        entry.tokens_5h = entry.tokens_5h.saturating_add(tokens);
+    }
+}
+
+/// Remaining quota percentage counting DOWN from `100.0` to `0.0` (0.1 precision).
+fn remaining_percent_u32(used: u32, budget: u32) -> f64 {
+    if budget == 0 {
+        return 0.0;
+    }
+    let used_pct = (f64::from(used) / f64::from(budget)) * 100.0;
+    let rem = (100.0 - used_pct).clamp(0.0, 100.0);
+    (rem * 10.0).round() / 10.0
+}
+
+fn window_reset_secs(
+    cooldown_until: Option<DateTime<Utc>>,
+    oldest_5h: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<u64> {
+    if let Some(until) = cooldown_until
+        && until > now
+    {
+        return u64::try_from((until - now).num_seconds()).ok();
+    }
+    if let Some(oldest) = oldest_5h {
+        let window_end = oldest + Duration::hours(5);
+        if window_end > now {
+            return u64::try_from((window_end - now).num_seconds()).ok();
+        }
+    }
+    None
+}
+
+fn update_oldest(slot: &mut Option<DateTime<Utc>>, ts: DateTime<Utc>) {
+    if slot.is_none_or(|prev| ts < prev) {
+        *slot = Some(ts);
+    }
+}
+
+/// Safe `u64 / u64 -> percentage (0.1 precision)` without `as` conversions.
+fn ratio_percent_u64(num: u64, den: u64) -> f64 {
+    if den == 0 {
+        return 0.0;
+    }
+    let scaled = u128::from(num)
+        .saturating_mul(1000)
+        .saturating_div(u128::from(den));
+    let clamped = u32::try_from(scaled.min(u128::from(u32::MAX))).unwrap_or(u32::MAX);
+    f64::from(clamped) / 10.0
+}
+
+/// Format reset countdown seconds into dot-matrix clock format (`2:23`, `0:11`, or `5:00` when ready).
+pub fn format_clock_hm(secs: Option<u64>) -> String {
+    let Some(total) = secs else {
+        return "5:00".to_owned();
+    };
+    if total == 0 {
+        return "0:00".to_owned();
+    }
+    let hours = total / 3600;
+    let mins = (total % 3600) / 60;
+    format!("{hours}:{mins:02}")
+}
+
+/// Format reset countdown seconds into compact human text (e.g. `4h 12m` or `18m`).
+pub fn format_reset_secs(secs: Option<u64>) -> String {
+    let Some(total) = secs else {
+        return String::new();
+    };
+    if total == 0 {
+        return String::new();
+    }
+    let hours = total / 3600;
+    let mins = (total % 3600) / 60;
+    if hours >= 1 {
+        format!("{hours}h {mins}m")
+    } else {
+        format!("{}m", mins.max(1))
+    }
+}
+
+/// Format large token counts compactly (`1.4M`, `240K`, `850`).
+pub fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        let tenths = u32::try_from((n / 100_000).min(u64::from(u32::MAX))).unwrap_or(u32::MAX);
+        format!("{:.1}M", f64::from(tenths) / 10.0)
+    } else if n >= 1_000 {
+        format!("{}K", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Build the static list of enforced rules `R1..R5` for UI transparency.
+pub fn enforced_rules_status() -> Vec<RuleStatus> {
+    RuleId::all()
+        .into_iter()
+        .map(|rule| RuleStatus {
+            rule,
+            code: rule.code().to_owned(),
+            title: rule.title().to_owned(),
+            description: rule.description().to_owned(),
+            enforced: true,
+        })
+        .collect()
+}
+
+/// Domain policy enforcement for Rules R1..R5.
+pub mod policy {
+    use agswitch_primitives::{AppError, RuleId};
+    use agswitch_spec::AccountProfile;
+
+    /// Rule R1: never allow disk deletion or login reset against the primary OS profile.
+    pub fn check_can_delete_disk(profile: &AccountProfile, delete_disk: bool) -> Result<(), AppError> {
+        if profile.is_default_profile && delete_disk {
+            return Err(AppError::PolicyBlocked {
+                rule: RuleId::R1,
+                message: "cannot delete disk files for the primary OS profile; hide it instead"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Rule R1: never allow resetting login token / UserData on the primary OS profile.
+    pub fn check_can_reset_login(profile: &AccountProfile) -> Result<(), AppError> {
+        if profile.is_default_profile {
+            return Err(AppError::PolicyBlocked {
+                rule: RuleId::R1,
+                message: "cannot reset login for primary OS profile; sign out inside Antigravity"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Rule R4: require explicit destructive confirmation before deleting disk vaults or resetting logins.
+    pub fn check_destructive_confirmed(confirmed: bool, action: &str) -> Result<(), AppError> {
+        if !confirmed {
+            return Err(AppError::PolicyBlocked {
+                rule: RuleId::R4,
+                message: format!("destructive action '{action}' requires explicit confirmation"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Rule R2: redact any accidental token strings from centralized audit summaries.
+    pub fn redact_audit_summary(raw: &str) -> String {
+        let mut out = raw.to_owned();
+        for needle in ["ya29.", "Bearer ", "oauth_token=", "jetski-standalone-oauth-token"] {
+            if out.contains(needle) {
+                out = out.replace(needle, "[REDACTED]");
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use agswitch_primitives::{AccountId, AccountTier, RuleId, RuntimeOs};
+    use agswitch_spec::{AccountProfile, TranscriptFeed, UsageLedger};
+    use chrono::{TimeZone, Utc};
+
+    use super::*;
+
+    #[test]
+    fn cmdline_parser_handles_macos_and_windows_paths() -> Result<(), String> {
+        let win_profile = AccountProfile::create_isolated(
+            AccountId::new("acc2").map_err(|e| e.to_string())?,
+            "Acc2".to_owned(),
+            String::new(),
+            "#6FD8EE".to_owned(),
+            r"C:\AntigravityProfiles\Acc2".to_owned(),
+        );
+        let mac_profile = AccountProfile::create_isolated(
+            AccountId::new("work").map_err(|e| e.to_string())?,
+            "Work".to_owned(),
+            String::new(),
+            "#9FC8FF".to_owned(),
+            "/Users/dev/Library/Application Support/AgSwitch/Profiles/Work".to_owned(),
+        );
+        let profiles = vec![AccountProfile::create_default(), win_profile, mac_profile];
+
+        let win_cmd = r#""C:\App\Antigravity.exe" --user-data-dir="C:\AntigravityProfiles\Acc2\UserData""#;
+        assert_eq!(match_profile_id(win_cmd, &profiles, RuntimeOs::Windows), "acc2");
+
+        let mac_cmd = r#"/Applications/Antigravity.app/Contents/MacOS/Antigravity --user-data-dir="/Users/dev/Library/Application Support/AgSwitch/Profiles/Work/UserData""#;
+        assert_eq!(match_profile_id(mac_cmd, &profiles, RuntimeOs::MacOs), "work");
+
+        // Whole-argument quoted form (e.g. from OS cmdline formatter with spaces in "Application Support")
+        let mac_whole_quoted = r#"/Applications/Antigravity.app/Contents/MacOS/Antigravity "--user-data-dir=/Users/dev/Library/Application Support/AgSwitch/Profiles/Work/UserData""#;
+        assert_eq!(
+            match_profile_id(mac_whole_quoted, &profiles, RuntimeOs::MacOs),
+            "work"
+        );
+
+        let default_cmd = "/Applications/Antigravity.app/Contents/MacOS/Antigravity";
+        assert_eq!(match_profile_id(default_cmd, &profiles, RuntimeOs::MacOs), "default");
+
+        assert!(is_child_process("/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper.app --type=renderer"));
+        assert!(!is_child_process(mac_cmd));
+        Ok(())
+    }
+
+    #[test]
+    fn launch_spec_builds_isolated_macos_and_windows_envs() -> Result<(), String> {
+        let mac_p = AccountProfile::create_isolated(
+            AccountId::new("work").map_err(|e| e.to_string())?,
+            "Work".to_owned(),
+            String::new(),
+            "#6FD8EE".to_owned(),
+            "/Users/dev/AgSwitch/Work".to_owned(),
+        );
+        let mac_spec = build_launch_spec(
+            &mac_p,
+            "/Applications/Antigravity.app/Contents/MacOS/Antigravity",
+            RuntimeOs::MacOs,
+        );
+        assert_eq!(
+            mac_spec.env_overrides.get("HOME").map(String::as_str),
+            Some("/Users/dev/AgSwitch/Work")
+        );
+        assert_eq!(
+            mac_spec.env_overrides.get("SSH_CONNECTION").map(String::as_str),
+            Some(MOCK_SSH_CONNECTION)
+        );
+        assert_eq!(
+            mac_spec.arguments.first().map(String::as_str),
+            Some("--user-data-dir=/Users/dev/AgSwitch/Work/UserData")
+        );
+
+        let win_p = AccountProfile::create_isolated(
+            AccountId::new("acc2").map_err(|e| e.to_string())?,
+            "Acc2".to_owned(),
+            String::new(),
+            "#6FD8EE".to_owned(),
+            r"C:\AntigravityProfiles\Acc2".to_owned(),
+        );
+        let win_spec = build_launch_spec(&win_p, r"C:\App\Antigravity.exe", RuntimeOs::Windows);
+        assert_eq!(
+            win_spec.env_overrides.get("USERPROFILE").map(String::as_str),
+            Some(r"C:\AntigravityProfiles\Acc2")
+        );
+        assert_eq!(
+            win_spec.env_overrides.get("APPDATA").map(String::as_str),
+            Some(r"C:\AntigravityProfiles\Acc2\AppData\Roaming")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_skips_active_cooldown_accounts() -> Result<(), String> {
+        let p0 = AccountProfile::create_default();
+        let p1 = AccountProfile::create_isolated(
+            AccountId::new("work").map_err(|e| e.to_string())?,
+            "Work".to_owned(),
+            String::new(),
+            "#6FD8EE".to_owned(),
+            "/tmp/work".to_owned(),
+        );
+        let p2 = AccountProfile::create_isolated(
+            AccountId::new("backup").map_err(|e| e.to_string())?,
+            "Backup".to_owned(),
+            String::new(),
+            "#9FC8FF".to_owned(),
+            "/tmp/backup".to_owned(),
+        );
+        let profiles = vec![p0, p1, p2];
+        let running = BTreeSet::from(["default".to_owned()]);
+        let cooldown = BTreeSet::from(["work".to_owned()]);
+
+        let next = choose_next_profile(&profiles, &running, Some("default"), &cooldown)
+            .map_err(|e| e.to_string())?;
+        assert_eq!(next.id.as_str(), "backup");
+        Ok(())
+    }
+
+    #[test]
+    fn transcript_parser_ignores_malformed_lines_and_computes_usage() -> Result<(), String> {
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 24, 15, 0, 0)
+            .single()
+            .ok_or_else(|| "invalid test timestamp".to_owned())?;
+
+        assert!(parse_transcript_line("{corrupt json", now).is_none());
+        let user_step = parse_transcript_line(
+            r#"{"type":"USER_INPUT","created_at":"2026-11-24T14:00:00Z"}"#,
+            now,
+        )
+        .ok_or_else(|| "expected USER_INPUT step".to_owned())?;
+        let model_step = parse_transcript_line(
+            r#"{"type":"PLANNER_RESPONSE","created_at":"2026-11-24T14:01:00Z","model":"gemini-4-neon-high","input_tokens":10000,"cache_read_tokens":40000,"output_tokens":2000}"#,
+            now,
+        )
+        .ok_or_else(|| "expected PLANNER_RESPONSE step".to_owned())?;
+        let claude_weekly_step = parse_transcript_line(
+            r#"{"type":"PLANNER_RESPONSE","created_at":"2026-11-21T10:00:00Z","model":"claude-sonnet-4-5","input_tokens":5000,"cache_read_tokens":0,"output_tokens":1000}"#,
+            now,
+        )
+        .ok_or_else(|| "expected Claude weekly step".to_owned())?;
+        let gpt_5h_step = parse_transcript_line(
+            r#"{"type":"PLANNER_RESPONSE","created_at":"2026-11-24T13:30:00Z","model":"gpt-5.2-codex","input_tokens":4000,"cache_read_tokens":0,"output_tokens":1000}"#,
+            now,
+        )
+        .ok_or_else(|| "expected GPT 5h step".to_owned())?;
+        let expired_step = parse_transcript_line(
+            r#"{"type":"PLANNER_RESPONSE","created_at":"2026-11-10T10:00:00Z","model":"claude-opus-4","input_tokens":99999,"cache_read_tokens":0,"output_tokens":1}"#,
+            now,
+        )
+        .ok_or_else(|| "expected expired step".to_owned())?;
+
+        let profiles = vec![AccountProfile::create_default()];
+        let ledger = UsageLedger::default();
+        let feeds = vec![TranscriptFeed {
+            fixed_owner_profile_id: None,
+            last_write_utc: now,
+            steps: vec![
+                expired_step,
+                claude_weekly_step,
+                gpt_5h_step,
+                user_step,
+                model_step,
+            ],
+        }];
+
+        let snap = compute_usage_snapshot(&profiles, &ledger, &feeds, now);
+        assert_eq!(snap.total_turns_24h, 1);
+        assert_eq!(snap.total_tokens_24h, 57_000);
+        assert_eq!(snap.total_turns_7d, 1);
+        assert_eq!(snap.total_tokens_7d, 63_000);
+        assert_eq!(snap.active_context_tokens, 52_000);
+        assert!((snap.active_context_budget_percent - 5.2).abs() < 0.2);
+
+        let metrics = snap
+            .by_profile_id
+            .get("default")
+            .ok_or_else(|| "missing default metrics".to_owned())?;
+        assert_eq!(metrics.tier, AccountTier::Pro);
+        assert_eq!(metrics.turns_5h, 1);
+        assert_eq!(metrics.steps_5h, 2);
+        assert_eq!(metrics.steps_7d, 3);
+        assert_eq!(metrics.models.gemini_calls_5h, 1);
+        assert_eq!(metrics.models.gemini_calls_7d, 1);
+        assert_eq!(metrics.models.claude_calls_5h, 0);
+        assert_eq!(metrics.models.claude_calls_7d, 1);
+        assert_eq!(metrics.models.gpt_calls_5h, 1);
+        assert_eq!(metrics.models.gpt_calls_7d, 1);
+        assert!(metrics.models.gemini_remaining_5h_pct < 100.0);
+        assert!(metrics.models.gemini_remaining_5h_pct > 95.0);
+        assert!(metrics.models.claude_gpt_remaining_5h_pct < 100.0);
+        assert!(metrics.models.by_model.contains_key("gemini-4-neon-high"));
+        assert!(metrics.models.by_model.contains_key("claude-sonnet-4-5"));
+        assert!(metrics.models.by_model.contains_key("gpt-5.2-codex"));
+        Ok(())
+    }
+
+    #[test]
+    fn r2_audit_redaction_and_marker_paths() -> Result<(), String> {
+        let redacted = policy::redact_audit_summary("failed with Bearer secret and ya29.abc");
+        assert!(!redacted.contains("Bearer "));
+        assert!(!redacted.contains("ya29."));
+
+        let p = AccountProfile::create_default();
+        let res = policy::check_can_delete_disk(&p, true);
+        assert!(matches!(
+            res,
+            Err(AppError::PolicyBlocked { rule: RuleId::R1, .. })
+        ));
+        Ok(())
+    }
+}
