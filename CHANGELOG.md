@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.2] — macOS LaunchServices (Microphone / TCC) & Keychain Fix
+
+### macOS
+- **Launch via macOS LaunchServices (`open -n -a`)**: Spawns `Antigravity.app` under `launchd` (`PPID = 1`) instead of as a direct child of `AGY Swap.app`, preserving `com.google.antigravity` as the TCC Responsible Process so Microphone (Voice mode), Camera, Screen Recording, Notifications, Keychain ACLs, and native window focus work across all isolated accounts.
+- **Automatic login Keychain link (`Library/Keychains`)**: Isolated profiles override `HOME`, which previously caused `SecKeychainCopyDefault()` to fall back to root-owned `System.keychain` and trigger Keychain prompts on login. `ensure_os_runtime_links()` now symlinks `<profile>/Library/Keychains` → `~/Library/Keychains` idempotently while keeping Rule R1 safe-unlink guarantees on delete.
+- **Clean Default-profile env isolation**: Clears `XDG_CONFIG_HOME` and `XDG_DATA_HOME` alongside `SSH_CONNECTION` when switching back to the primary OS profile.
+- **macOS install script fix (`scripts/package-macos.sh`)**: Uses `pkill -f` on the bundle executable path instead of `pkill -x agswitch-desktop` (which macOS truncated at 15 characters), ensuring `--install` cleanly stops previous running instances.
+
+### Release Artifacts
+- **macOS (Apple Silicon / arm64):**
+  - `AGY-Swap-v0.1.2-macos-arm64.dmg` (`sha256: c86b3bfa6bf91b6f742008d210d02884a5dcb3692063bbd91bf1712a199af5a6`)
+  - `agswitch-cli-v0.1.2-macos-arm64.tar.gz` (`sha256: 75ad6bbe5b8f3b42311783034a802684e9774489f951de02338e99a556aba0fa`)
+  - `SHA256SUMS-macos-arm64.txt`
+- **Windows 10/11 (x86_64):** no changes in this release. `v0.1.1` remains the current Windows build.
+
 ## [0.1.1] — Windows Hide to Tray
 
 ### Windows

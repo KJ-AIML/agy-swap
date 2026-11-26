@@ -33,6 +33,12 @@ pub trait ProcessPort: Send + Sync {
 pub trait WorkspaceLinkPort: Send + Sync {
     fn discover_vault_folders(&self, profiles_root: &str) -> Result<Vec<String>, AppError>;
     fn ensure_dirs(&self, dirs: &[String]) -> Result<(), AppError>;
+    /// Ensure OS-specific runtime links (e.g. macOS `Library/Keychains` symlink) exist for isolated
+    /// profiles so OS services resolve the user's login keychain instead of failing to System.keychain.
+    fn ensure_os_runtime_links(&self, profile: &AccountProfile) -> Result<(), AppError> {
+        let _ = profile;
+        Ok(())
+    }
     fn is_authenticated(&self, profile: &AccountProfile) -> bool;
     fn is_shared_mode_enabled(&self, profile: &AccountProfile) -> bool;
     fn enable_shared_mode(&self, profile: &AccountProfile) -> Result<(), AppError>;
@@ -621,6 +627,7 @@ impl Engine {
                 self.defaults.runtime_os,
             );
             self.workspace.ensure_dirs(&spec.dirs_to_ensure)?;
+            self.workspace.ensure_os_runtime_links(&target)?;
             self.process.launch_spec(&spec)?;
         }
 
@@ -667,6 +674,7 @@ impl Engine {
                 self.defaults.runtime_os,
             );
             self.workspace.ensure_dirs(&spec.dirs_to_ensure)?;
+            self.workspace.ensure_os_runtime_links(&target)?;
             self.process.launch_spec(&spec)?;
             false
         };
@@ -775,6 +783,7 @@ impl Engine {
             self.defaults.runtime_os,
         );
         self.workspace.ensure_dirs(&spec.dirs_to_ensure)?;
+        self.workspace.ensure_os_runtime_links(&profile)?;
 
         if input.share_chats_and_skills {
             self.workspace.enable_shared_mode(&profile)?;

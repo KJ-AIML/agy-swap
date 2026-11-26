@@ -203,6 +203,25 @@ impl OsProcessAdapter {
         None
     }
 
+    /// Resolve `/path/to/Foo.app` when `exe` points to `/path/to/Foo.app/Contents/MacOS/<bin>`.
+    #[cfg(any(target_os = "macos", test))]
+    fn macos_app_bundle_for_executable(exe: &Path) -> Option<PathBuf> {
+        let macos_dir = exe.parent()?;
+        if macos_dir.file_name().and_then(|n| n.to_str()) != Some("MacOS") {
+            return None;
+        }
+        let contents_dir = macos_dir.parent()?;
+        if contents_dir.file_name().and_then(|n| n.to_str()) != Some("Contents") {
+            return None;
+        }
+        let app_bundle = contents_dir.parent()?;
+        let is_app = app_bundle
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("app"));
+        is_app.then(|| app_bundle.to_path_buf())
+    }
+
     fn send_graceful_terminate(pid: u32) {
         #[cfg(target_os = "windows")]
         {
@@ -345,6 +364,46 @@ impl ProcessPort for OsProcessAdapter {
                 "Antigravity executable not found at '{}'",
                 spec.exe_path
             )));
+        }
+
+        // On macOS, launch `.app` bundles through LaunchServices (`open -n -a`) so the OS assigns
+        // TCC Responsible Process (Microphone, Camera, Screen Recording, Keychain ACLs) to
+        // `Antigravity.app` itself (PPID=1) instead of inheriting `AGY Swap.app`'s bundle identity.
+        #[cfg(target_os = "macos")]
+        if let Some(app_bundle) = Self::macos_app_bundle_for_executable(exe)
+            && app_bundle.is_dir()
+        {
+            let mut cmd = Command::new("/usr/bin/open");
+            cmd.arg("-n")
+                .arg("-a")
+                .arg(&app_bundle)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+
+            // Strip removed vars from `open`'s own env so LaunchServices does not inherit them.
+            for key in &spec.env_removals {
+                cmd.env_remove(key);
+            }
+            for (k, v) in &spec.env_overrides {
+                cmd.arg("--env").arg(format!("{k}={v}"));
+            }
+            if !spec.arguments.is_empty() {
+                cmd.arg("--args").args(&spec.arguments);
+            }
+
+            let output = cmd.output().map_err(|e| {
+                AppError::Integration(format!("failed to invoke macOS LaunchServices open: {e}"))
+            })?;
+            if !output.status.success() {
+                let err = String::from_utf8_lossy(&output.stderr);
+                return Err(AppError::Integration(format!(
+                    "macOS LaunchServices failed to launch '{}': {}",
+                    app_bundle.display(),
+                    err.trim()
+                )));
+            }
+            return Ok(());
         }
 
         let mut cmd = Command::new(exe);
@@ -596,6 +655,42 @@ impl WorkspaceLinkPort for OsWorkspaceLinkAdapter {
             fs::create_dir_all(dir)
                 .map_err(|e| AppError::Integration(format!("create dir '{dir}' failed: {e}")))?;
         }
+        Ok(())
+    }
+
+    fn ensure_os_runtime_links(&self, profile: &AccountProfile) -> Result<(), AppError> {
+        if profile.is_default_profile || profile.root_path.trim().is_empty() {
+            return Ok(());
+        }
+
+        // On macOS, isolated profiles override `HOME` to `<root_path>`. Without `<root>/Library/Keychains`,
+        // `SecKeychainCopyDefault()` fails with "A default keychain could not be found" and falls back
+        // to root-owned `/Library/Keychains/System.keychain`, prompting for Keychain credentials on login.
+        // Symlinking `Library/Keychains` to the user's primary login Keychains resolves `login.keychain-db`
+        // cleanly while Rule R1 (`unlink_all_links_under`) guarantees delete never follows symlinks.
+        #[cfg(target_os = "macos")]
+        {
+            let primary_keychains = self.primary_home.join("Library").join("Keychains");
+            if !primary_keychains.is_dir() {
+                return Ok(());
+            }
+            let profile_lib = Path::new(&profile.root_path).join("Library");
+            fs::create_dir_all(&profile_lib).map_err(|e| {
+                AppError::Integration(format!("create profile Library dir failed: {e}"))
+            })?;
+            let link_path = profile_lib.join("Keychains");
+            if Self::is_link_or_reparse_point(&link_path) {
+                if fs::read_link(&link_path).ok().as_deref() == Some(primary_keychains.as_path()) {
+                    return Ok(());
+                }
+                Self::remove_link_only(&link_path)?;
+            } else if link_path.exists() {
+                // Real directory already exists — leave untouched to avoid clobbering user data.
+                return Ok(());
+            }
+            Self::create_dir_link(&link_path, &primary_keychains)?;
+        }
+
         Ok(())
     }
 
@@ -1127,10 +1222,10 @@ pub mod sandbox {
             now: DateTime<Utc>,
         ) -> Result<Vec<TranscriptFeed>, AppError> {
             let mut sc_steps = Vec::new();
-            // 5h window: 12 Gemini, 4 Claude, 2 GPT
-            for i in 0..12_u32 {
+            // 5h window: 12 Gemini (8 Neon + 4 Carbon), 4 Claude Sonnet 5.5, 2 GPT-OSS 120B
+            for i in 0..8_u32 {
                 sc_steps.push(demo_step(
-                    now - Duration::minutes(i64::from(i) * 12 + 5),
+                    now - Duration::minutes(i64::from(i) * 14 + 5),
                     "gemini-4-neon-high",
                     42_000,
                     210_000,
@@ -1139,8 +1234,17 @@ pub mod sandbox {
             }
             for i in 0..4_u32 {
                 sc_steps.push(demo_step(
+                    now - Duration::minutes(i64::from(i) * 28 + 18),
+                    "gemini-4-carbon-medium",
+                    28_000,
+                    145_000,
+                    1_700,
+                ));
+            }
+            for i in 0..4_u32 {
+                sc_steps.push(demo_step(
                     now - Duration::minutes(i64::from(i) * 35 + 15),
-                    "claude-sonnet-4-5",
+                    "claude-sonnet-5-5",
                     18_000,
                     95_000,
                     1_900,
@@ -1149,26 +1253,35 @@ pub mod sandbox {
             for i in 0..2_u32 {
                 sc_steps.push(demo_step(
                     now - Duration::minutes(i64::from(i) * 50 + 25),
-                    "gpt-5.2-codex",
+                    "gpt-oss-120b",
                     14_000,
                     60_000,
                     1_400,
                 ));
             }
-            // Weekly (days 2..5): +36 Gemini, +8 Claude, +3 GPT
-            for i in 0..36_u32 {
+            // Weekly (days 2..5): +24 Neon, +12 Carbon, +8 Opus 5.5, +3 GPT-OSS 120B
+            for i in 0..24_u32 {
                 sc_steps.push(demo_step(
-                    now - Duration::hours(i64::from(i) * 3 + 12),
+                    now - Duration::hours(i64::from(i) * 4 + 12),
                     "gemini-4-neon-high",
                     35_000,
                     180_000,
                     1_800,
                 ));
             }
+            for i in 0..12_u32 {
+                sc_steps.push(demo_step(
+                    now - Duration::hours(i64::from(i) * 8 + 16),
+                    "gemini-4-carbon-medium",
+                    26_000,
+                    135_000,
+                    1_500,
+                ));
+            }
             for i in 0..8_u32 {
                 sc_steps.push(demo_step(
                     now - Duration::hours(i64::from(i) * 11 + 18),
-                    "claude-opus-4",
+                    "claude-opus-5-5",
                     22_000,
                     110_000,
                     2_600,
@@ -1177,7 +1290,7 @@ pub mod sandbox {
             for i in 0..3_u32 {
                 sc_steps.push(demo_step(
                     now - Duration::hours(i64::from(i) * 20 + 30),
-                    "gpt-5.2-codex",
+                    "gpt-oss-120b",
                     16_000,
                     70_000,
                     1_500,
@@ -1188,7 +1301,7 @@ pub mod sandbox {
             for i in 0..9_u32 {
                 trade_steps.push(demo_step(
                     now - Duration::minutes(i64::from(i) * 18 + 10),
-                    "claude-sonnet-4-5",
+                    "claude-sonnet-5-5",
                     20_000,
                     84_000,
                     1_700,
@@ -1197,7 +1310,7 @@ pub mod sandbox {
             for i in 0..11_u32 {
                 trade_steps.push(demo_step(
                     now - Duration::hours(i64::from(i) * 9 + 8),
-                    "gpt-5.2-codex",
+                    "gpt-oss-120b",
                     15_000,
                     62_000,
                     1_300,
@@ -1206,7 +1319,7 @@ pub mod sandbox {
             for i in 0..8_u32 {
                 trade_steps.push(demo_step(
                     now - Duration::hours(i64::from(i) * 14 + 22),
-                    "gemini-3-pro",
+                    "gemini-4-hydrogen-medium",
                     25_000,
                     90_000,
                     1_600,
@@ -1217,7 +1330,7 @@ pub mod sandbox {
             for i in 0..6_u32 {
                 work_steps.push(demo_step(
                     now - Duration::minutes(i64::from(i) * 22 + 8),
-                    "claude-opus-4",
+                    "claude-opus-5-5",
                     28_000,
                     125_000,
                     2_400,
@@ -1226,7 +1339,7 @@ pub mod sandbox {
             for i in 0..28_u32 {
                 work_steps.push(demo_step(
                     now - Duration::hours(i64::from(i) * 4 + 10),
-                    "claude-sonnet-4-5",
+                    "claude-sonnet-5-5",
                     19_000,
                     88_000,
                     1_900,
@@ -1235,7 +1348,7 @@ pub mod sandbox {
             for i in 0..6_u32 {
                 work_steps.push(demo_step(
                     now - Duration::hours(i64::from(i) * 16 + 15),
-                    "gpt-5.2",
+                    "gpt-oss-120b",
                     12_000,
                     48_000,
                     1_100,
@@ -1371,6 +1484,79 @@ mod tests {
             .map_err(|e| e.to_string())?;
         assert!(!vault_root.exists());
         assert!(precious_skill.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn macos_app_bundle_resolution_matches_standard_bundles() {
+        assert_eq!(
+            OsProcessAdapter::macos_app_bundle_for_executable(Path::new(
+                "/Applications/Antigravity.app/Contents/MacOS/Antigravity"
+            )),
+            Some(PathBuf::from("/Applications/Antigravity.app"))
+        );
+        assert_eq!(
+            OsProcessAdapter::macos_app_bundle_for_executable(Path::new(
+                "/Users/dev/Applications/Antigravity.app/Contents/MacOS/Antigravity"
+            )),
+            Some(PathBuf::from("/Users/dev/Applications/Antigravity.app"))
+        );
+        assert_eq!(
+            OsProcessAdapter::macos_app_bundle_for_executable(Path::new(
+                "/usr/local/bin/antigravity"
+            )),
+            None
+        );
+        assert_eq!(
+            OsProcessAdapter::macos_app_bundle_for_executable(Path::new(
+                r"C:\Programs\antigravity\Antigravity.exe"
+            )),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_keychains_runtime_link_is_idempotent_and_r1_safe_on_delete() -> Result<(), String> {
+        let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let primary_home = tmp.path().join("primary_home");
+        let vault_root = tmp.path().join("vault_trade");
+
+        let primary_kc = primary_home.join("Library").join("Keychains");
+        fs::create_dir_all(&primary_kc).map_err(|e| e.to_string())?;
+        let login_kc_marker = primary_kc.join("login.keychain-db.marker");
+        fs::write(&login_kc_marker, "do-not-delete").map_err(|e| e.to_string())?;
+
+        let adapter = OsWorkspaceLinkAdapter::new(primary_home);
+        let profile = AccountProfile::create_isolated(
+            AccountId::new("trade").map_err(|e| e.to_string())?,
+            "Trade".to_owned(),
+            String::new(),
+            "#6FD8EE".to_owned(),
+            vault_root.to_string_lossy().into_owned(),
+        );
+
+        // First call creates the Library/Keychains symlink; second call is idempotent
+        adapter
+            .ensure_os_runtime_links(&profile)
+            .map_err(|e| e.to_string())?;
+        adapter
+            .ensure_os_runtime_links(&profile)
+            .map_err(|e| e.to_string())?;
+
+        let link_path = vault_root.join("Library").join("Keychains");
+        assert!(OsWorkspaceLinkAdapter::is_link_or_reparse_point(&link_path));
+        assert_eq!(
+            fs::read_link(&link_path).map_err(|e| e.to_string())?,
+            primary_kc
+        );
+
+        // Rule R1: deleting the vault unlinks Library/Keychains first and preserves primary keychain dir
+        adapter
+            .delete_vault_directory_safely(&profile.root_path)
+            .map_err(|e| e.to_string())?;
+        assert!(!vault_root.exists());
+        assert!(login_kc_marker.exists());
         Ok(())
     }
 }

@@ -251,7 +251,7 @@ pub struct ModelUsageBreakdown {
     pub gemini_reset_5h_label: String,
     /// Estimated 5h window reset countdown for Claude & GPT pool.
     pub claude_gpt_reset_5h_label: String,
-    /// Exact model ID breakdown (e.g. `gemini-4-neon-high`, `claude-sonnet-4-5`, `gpt-5.2-codex`).
+    /// Exact model ID breakdown (e.g. `gemini-4-neon-high`, `claude-sonnet-5-5`, `gpt-oss-120b`).
     pub by_model: BTreeMap<String, SingleModelUsage>,
 }
 

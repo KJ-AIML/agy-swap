@@ -167,11 +167,19 @@ pub fn build_launch_spec(
     os: RuntimeOs,
 ) -> LaunchSpec {
     if profile.is_default_profile {
+        let env_removals = match os {
+            RuntimeOs::Windows => vec!["SSH_CONNECTION".to_owned()],
+            RuntimeOs::MacOs | RuntimeOs::Linux => vec![
+                "SSH_CONNECTION".to_owned(),
+                "XDG_CONFIG_HOME".to_owned(),
+                "XDG_DATA_HOME".to_owned(),
+            ],
+        };
         return LaunchSpec {
             exe_path: antigravity_bin_path.to_owned(),
             arguments: Vec::new(),
             env_overrides: BTreeMap::new(),
-            env_removals: vec!["SSH_CONNECTION".to_owned()],
+            env_removals,
             dirs_to_ensure: Vec::new(),
         };
     }
@@ -1053,6 +1061,26 @@ mod tests {
             win_spec.env_overrides.get("APPDATA").map(String::as_str),
             Some(r"C:\AntigravityProfiles\Acc2\AppData\Roaming")
         );
+
+        let default_mac = build_launch_spec(
+            &AccountProfile::create_default(),
+            "/Applications/Antigravity.app/Contents/MacOS/Antigravity",
+            RuntimeOs::MacOs,
+        );
+        assert!(default_mac.arguments.is_empty());
+        assert!(default_mac.env_overrides.is_empty());
+        assert!(
+            default_mac
+                .env_removals
+                .iter()
+                .any(|k| k == "SSH_CONNECTION")
+        );
+        assert!(
+            default_mac
+                .env_removals
+                .iter()
+                .any(|k| k == "XDG_CONFIG_HOME")
+        );
         Ok(())
     }
 
@@ -1102,17 +1130,17 @@ mod tests {
         )
         .ok_or_else(|| "expected PLANNER_RESPONSE step".to_owned())?;
         let claude_weekly_step = parse_transcript_line(
-            r#"{"type":"PLANNER_RESPONSE","created_at":"2026-11-21T10:00:00Z","model":"claude-sonnet-4-5","input_tokens":5000,"cache_read_tokens":0,"output_tokens":1000}"#,
+            r#"{"type":"PLANNER_RESPONSE","created_at":"2026-11-21T10:00:00Z","model":"claude-sonnet-5-5","input_tokens":5000,"cache_read_tokens":0,"output_tokens":1000}"#,
             now,
         )
         .ok_or_else(|| "expected Claude weekly step".to_owned())?;
         let gpt_5h_step = parse_transcript_line(
-            r#"{"type":"PLANNER_RESPONSE","created_at":"2026-11-24T13:30:00Z","model":"gpt-5.2-codex","input_tokens":4000,"cache_read_tokens":0,"output_tokens":1000}"#,
+            r#"{"type":"PLANNER_RESPONSE","created_at":"2026-11-24T13:30:00Z","model":"gpt-oss-120b","input_tokens":4000,"cache_read_tokens":0,"output_tokens":1000}"#,
             now,
         )
         .ok_or_else(|| "expected GPT 5h step".to_owned())?;
         let expired_step = parse_transcript_line(
-            r#"{"type":"PLANNER_RESPONSE","created_at":"2026-11-10T10:00:00Z","model":"claude-opus-4","input_tokens":99999,"cache_read_tokens":0,"output_tokens":1}"#,
+            r#"{"type":"PLANNER_RESPONSE","created_at":"2026-11-10T10:00:00Z","model":"claude-opus-5-5","input_tokens":99999,"cache_read_tokens":0,"output_tokens":1}"#,
             now,
         )
         .ok_or_else(|| "expected expired step".to_owned())?;
@@ -1157,8 +1185,8 @@ mod tests {
         assert!(metrics.models.gemini_remaining_5h_pct > 95.0);
         assert!(metrics.models.claude_gpt_remaining_5h_pct < 100.0);
         assert!(metrics.models.by_model.contains_key("gemini-4-neon-high"));
-        assert!(metrics.models.by_model.contains_key("claude-sonnet-4-5"));
-        assert!(metrics.models.by_model.contains_key("gpt-5.2-codex"));
+        assert!(metrics.models.by_model.contains_key("claude-sonnet-5-5"));
+        assert!(metrics.models.by_model.contains_key("gpt-oss-120b"));
         Ok(())
     }
 

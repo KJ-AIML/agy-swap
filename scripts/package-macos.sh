@@ -228,7 +228,8 @@ ls -lh "$DMG_PATH" "$CLI_ZIP" "$DIST_DIR/SHA256SUMS-macos-${ARCH}.txt"
 if [ "$INSTALL_LOCAL" -eq 1 ]; then
   echo "==> Installing '${APP_NAME}.app' into /Applications..."
   # Stop any previous running instance cleanly before replacing bundle
-  pkill -x agswitch-desktop 2>/dev/null || true
+  # (macOS `pkill -x` truncates names at 15 chars; match the bundle binary path via `-f`)
+  pkill -f "AGY Swap.app/Contents/MacOS/agswitch-desktop" 2>/dev/null || true
   sleep 0.3
   rm -rf "/Applications/${APP_NAME}.app"
   cp -R "$APP_DIR" "/Applications/${APP_NAME}.app"
