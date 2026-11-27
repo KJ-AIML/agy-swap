@@ -220,7 +220,7 @@ hdiutil create \
 rm -rf "$STAGE"
 
 tar -czf "$CLI_ZIP" -C "$ROOT/target/release" agswitch-cli
-shasum -a 256 "$DMG_PATH" "$CLI_ZIP" > "$DIST_DIR/SHA256SUMS-macos-${ARCH}.txt"
+(cd "$DIST_DIR" && shasum -a 256 "$DMG_NAME" "$(basename "$CLI_ZIP")" > "SHA256SUMS-macos-${ARCH}.txt")
 
 echo "==> Packaged artifacts:"
 ls -lh "$DMG_PATH" "$CLI_ZIP" "$DIST_DIR/SHA256SUMS-macos-${ARCH}.txt"

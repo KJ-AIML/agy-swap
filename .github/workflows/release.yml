@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build & publish (e.g. v0.1.3)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    name: Build macOS (arm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify (layers, purity, clippy, tests)
+        run: cargo run -p xtask -- verify
+      - name: Package macOS DMG & CLI
+        run: ./scripts/package-macos.sh
+      - name: Upload macOS release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-arm64
+          path: |
+            dist/AGY-Swap-v*-macos-*.dmg
+            dist/agswitch-cli-v*-macos-*.tar.gz
+            dist/SHA256SUMS-macos-*.txt
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows (x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify (layers, purity, clippy, tests)
+        run: cargo run -p xtask -- verify
+      - name: Package Windows portable ZIP
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1
+      - name: Upload Windows release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x86_64
+          path: |
+            dist/AGY-Swap-v*-windows-x86_64.zip
+            dist/SHA256SUMS-windows-x86_64.txt
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: release-*
+          merge-multiple: true
+      - name: Extract changelog notes & publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          ls -lh release-assets/
+
+          VER="${RELEASE_TAG#v}"
+          NOTES_FILE="$(mktemp)"
+          awk -v ver="$VER" '
+            $0 ~ "^## \\[" ver "\\]" { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > "$NOTES_FILE" || true
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; uploading assets with --clobber..."
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          elif [ -s "$NOTES_FILE" ]; then
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --title "AGY Swap $RELEASE_TAG" \
+              --notes-file "$NOTES_FILE"
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --title "AGY Swap $RELEASE_TAG" \
+              --generate-notes
+          fi
