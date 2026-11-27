@@ -8,7 +8,7 @@ use std::time::{Duration as StdDuration, SystemTime};
 
 use agswitch_engine::domain;
 use agswitch_engine::spec::{
-    AccountProfile, LaunchSpec, RunningInstance, TranscriptFeed, TranscriptStep,
+    AccountProfile, LaunchSpec, RunningInstance, TranscriptFeed, TranscriptStep, UpdateCheckState,
 };
 use agswitch_engine::{BoxFut, ClockPort, ProcessPort, TranscriptPort, WorkspaceLinkPort};
 use agswitch_primitives::{AppError, RuntimeOs};
@@ -663,32 +663,25 @@ impl WorkspaceLinkPort for OsWorkspaceLinkAdapter {
             return Ok(());
         }
 
-        // On macOS, isolated profiles override `HOME` to `<root_path>`. Without `<root>/Library/Keychains`,
-        // `SecKeychainCopyDefault()` fails with "A default keychain could not be found" and falls back
-        // to root-owned `/Library/Keychains/System.keychain`, prompting for Keychain credentials on login.
-        // Symlinking `Library/Keychains` to the user's primary login Keychains resolves `login.keychain-db`
-        // cleanly while Rule R1 (`unlink_all_links_under`) guarantees delete never follows symlinks.
+        // On macOS, isolated profiles MUST NOT symlink `<profile>/Library/Keychains` to
+        // `~/Library/Keychains`: Antigravity's language_server stores OAuth credentials in the
+        // default macOS `login.keychain-db` whenever it is reachable, causing secondary profiles
+        // to share/overwrite the primary account's login instead of storing separate tokens in
+        // `<profile>/.gemini/jetski-standalone-oauth-token`.
+        //
+        // Safely unlink ONLY a legacy v0.1.2 symlink pointing to the primary Keychains folder
+        // (Rule R1: never remove real directories or anything inside `~/Library/Keychains`).
         #[cfg(target_os = "macos")]
         {
             let primary_keychains = self.primary_home.join("Library").join("Keychains");
-            if !primary_keychains.is_dir() {
-                return Ok(());
-            }
-            let profile_lib = Path::new(&profile.root_path).join("Library");
-            fs::create_dir_all(&profile_lib).map_err(|e| {
-                AppError::Integration(format!("create profile Library dir failed: {e}"))
-            })?;
-            let link_path = profile_lib.join("Keychains");
-            if Self::is_link_or_reparse_point(&link_path) {
-                if fs::read_link(&link_path).ok().as_deref() == Some(primary_keychains.as_path()) {
-                    return Ok(());
-                }
+            let link_path = Path::new(&profile.root_path)
+                .join("Library")
+                .join("Keychains");
+            if Self::is_link_or_reparse_point(&link_path)
+                && fs::read_link(&link_path).ok().as_deref() == Some(primary_keychains.as_path())
+            {
                 Self::remove_link_only(&link_path)?;
-            } else if link_path.exists() {
-                // Real directory already exists — leave untouched to avoid clobbering user data.
-                return Ok(());
             }
-            Self::create_dir_link(&link_path, &primary_keychains)?;
         }
 
         Ok(())
@@ -964,6 +957,71 @@ fn hidden_command(program: &str) -> Command {
     let mut cmd = Command::new(program);
     cmd.creation_flags(CREATE_NO_WINDOW).stdin(Stdio::null());
     cmd
+}
+
+/// Public GitHub Releases endpoints tracked by AGY Swap for non-blocking update notices.
+pub const GITHUB_RELEASES_API_URL: &str =
+    "https://api.github.com/repos/KJ-AIML/agy-swap/releases?per_page=10";
+pub const GITHUB_RELEASES_PAGE_URL: &str = "https://github.com/KJ-AIML/agy-swap/releases";
+
+/// Query GitHub Releases for a newer platform-compatible AGY Swap build.
+/// Anonymous, read-only, 5-second timeout, zero extra crates (uses OS built-in `curl`).
+pub fn check_latest_github_release(current_version: &str) -> UpdateCheckState {
+    let ua = format!("agy-swap/{current_version}");
+    #[cfg(target_os = "macos")]
+    let mut cmd = Command::new("/usr/bin/curl");
+    #[cfg(target_os = "windows")]
+    let mut cmd = hidden_command("curl.exe");
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut cmd = Command::new("curl");
+
+    let output = cmd
+        .args([
+            "-fsSL",
+            "--connect-timeout",
+            "4",
+            "--max-time",
+            "6",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            &format!("User-Agent: {ua}"),
+            GITHUB_RELEASES_API_URL,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    let Ok(out) = output else {
+        return UpdateCheckState::Unavailable;
+    };
+    if !out.status.success() {
+        return UpdateCheckState::Unavailable;
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    domain::parse_github_releases_json(&body, current_version, RuntimeOs::current())
+        .unwrap_or(UpdateCheckState::Unavailable)
+}
+
+/// Open an `https://` URL in the user's default browser.
+pub fn open_url_in_browser(url: &str) -> Result<(), AppError> {
+    if !url.starts_with("https://") {
+        return Err(AppError::Validation(
+            "only https:// URLs can be opened in browser".to_owned(),
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    let res = Command::new("/usr/bin/open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let res = hidden_command("cmd.exe")
+        .args(["/c", "start", "", url])
+        .spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let res = Command::new("xdg-open").arg(url).spawn();
+
+    res.map_err(|e| AppError::Integration(format!("open browser URL failed: {e}")))?;
+    Ok(())
 }
 
 /// Convenience helper for app shells to open the local profiles directory in Finder / Explorer.
@@ -1517,7 +1575,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_keychains_runtime_link_is_idempotent_and_r1_safe_on_delete() -> Result<(), String> {
+    fn macos_legacy_keychains_symlink_is_unlinked_safely_and_never_created() -> Result<(), String> {
         let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
         let primary_home = tmp.path().join("primary_home");
         let vault_root = tmp.path().join("vault_trade");
@@ -1536,27 +1594,36 @@ mod tests {
             vault_root.to_string_lossy().into_owned(),
         );
 
-        // First call creates the Library/Keychains symlink; second call is idempotent
+        // Fresh profile MUST NOT link to primary Library/Keychains (keeps OAuth logins isolated)
         adapter
             .ensure_os_runtime_links(&profile)
             .map_err(|e| e.to_string())?;
-        adapter
-            .ensure_os_runtime_links(&profile)
-            .map_err(|e| e.to_string())?;
-
         let link_path = vault_root.join("Library").join("Keychains");
-        assert!(OsWorkspaceLinkAdapter::is_link_or_reparse_point(&link_path));
-        assert_eq!(
-            fs::read_link(&link_path).map_err(|e| e.to_string())?,
-            primary_kc
-        );
+        assert!(!link_path.exists());
+        assert!(!OsWorkspaceLinkAdapter::is_link_or_reparse_point(&link_path));
 
-        // Rule R1: deleting the vault unlinks Library/Keychains first and preserves primary keychain dir
-        adapter
-            .delete_vault_directory_safely(&profile.root_path)
+        // Legacy v0.1.2 symlink pointing to primary Keychains MUST be cleanly unlinked without touching target
+        let profile_lib = vault_root.join("Library");
+        fs::create_dir_all(&profile_lib).map_err(|e| e.to_string())?;
+        OsWorkspaceLinkAdapter::create_dir_link(&link_path, &primary_kc)
             .map_err(|e| e.to_string())?;
-        assert!(!vault_root.exists());
+        assert!(OsWorkspaceLinkAdapter::is_link_or_reparse_point(&link_path));
+
+        adapter
+            .ensure_os_runtime_links(&profile)
+            .map_err(|e| e.to_string())?;
+        assert!(!OsWorkspaceLinkAdapter::is_link_or_reparse_point(&link_path));
+        assert!(!link_path.exists());
         assert!(login_kc_marker.exists());
+
+        // Real non-symlink Library/Keychains directory must never be touched
+        fs::create_dir_all(&link_path).map_err(|e| e.to_string())?;
+        let real_marker = link_path.join("local-only.marker");
+        fs::write(&real_marker, "keep").map_err(|e| e.to_string())?;
+        adapter
+            .ensure_os_runtime_links(&profile)
+            .map_err(|e| e.to_string())?;
+        assert!(real_marker.exists());
         Ok(())
     }
 }

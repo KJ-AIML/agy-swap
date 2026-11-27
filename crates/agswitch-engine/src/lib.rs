@@ -33,8 +33,9 @@ pub trait ProcessPort: Send + Sync {
 pub trait WorkspaceLinkPort: Send + Sync {
     fn discover_vault_folders(&self, profiles_root: &str) -> Result<Vec<String>, AppError>;
     fn ensure_dirs(&self, dirs: &[String]) -> Result<(), AppError>;
-    /// Ensure OS-specific runtime links (e.g. macOS `Library/Keychains` symlink) exist for isolated
-    /// profiles so OS services resolve the user's login keychain instead of failing to System.keychain.
+    /// Ensure OS-specific runtime links for isolated profiles are in a clean, isolated state
+    /// (for example, cleaning up legacy v0.1.2 macOS `Library/Keychains` symlinks so accounts
+    /// never share the primary `login.keychain-db`).
     fn ensure_os_runtime_links(&self, profile: &AccountProfile) -> Result<(), AppError> {
         let _ = profile;
         Ok(())

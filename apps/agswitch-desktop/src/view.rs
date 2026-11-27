@@ -6,11 +6,15 @@ use std::time::{Duration, Instant};
 
 use agswitch_domain::{format_clock_hm, format_tokens, is_child_process};
 use agswitch_engine::Engine;
-use agswitch_integrations::open_directory_in_file_manager;
-use agswitch_primitives::{AccountTier, AppError, ModelFamily, PhaseId};
+use agswitch_integrations::{
+    GITHUB_RELEASES_PAGE_URL, check_latest_github_release, open_directory_in_file_manager,
+    open_url_in_browser,
+};
+use agswitch_primitives::{AccountTier, AppError, ModelFamily, PhaseId, RuntimeOs};
 use agswitch_spec::{
     AccountView, AddAccountInput, AuditEntry, AuditOutcome, CallerContext, CommandRequest,
     CommandResponse, DashboardSnapshot, DeleteAccountInput, SingleModelUsage, UpdateAccountInput,
+    UpdateCheckState,
 };
 use gpui::{
     AnyElement, Context, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement,
@@ -195,6 +199,7 @@ pub struct AgSwitchView {
     engine: Arc<Engine>,
     rt: Arc<tokio::runtime::Runtime>,
     shared_snap: Arc<Mutex<Option<DashboardSnapshot>>>,
+    shared_update: Arc<Mutex<UpdateCheckState>>,
     ui_prefs_path: PathBuf,
     is_sandbox: bool,
     on_close_notify: Option<Box<dyn Fn() + 'static>>,
@@ -203,6 +208,7 @@ pub struct AgSwitchView {
     page: PopoverPage,
     selected_profile_id: Option<String>,
     snapshot: Option<DashboardSnapshot>,
+    update_state: UpdateCheckState,
     audits: Vec<AuditEntry>,
     in_flight_phase: Option<PhaseId>,
     toast_line: Option<String>,
@@ -232,6 +238,7 @@ impl AgSwitchView {
         engine: Arc<Engine>,
         rt: Arc<tokio::runtime::Runtime>,
         shared_snap: Arc<Mutex<Option<DashboardSnapshot>>>,
+        shared_update: Arc<Mutex<UpdateCheckState>>,
         ui_prefs_path: PathBuf,
         is_sandbox: bool,
         demo_page: Option<String>,
@@ -241,6 +248,10 @@ impl AgSwitchView {
         focus_handle.focus(window);
 
         let initial_snap = shared_snap.lock().ok().and_then(|g| g.clone());
+        let initial_update = shared_update
+            .lock()
+            .ok()
+            .map_or(UpdateCheckState::Idle, |g| g.clone());
         let prefs = load_ui_prefs(&ui_prefs_path);
         let mut profile_orbs = BTreeMap::new();
         for (pid, pref) in &prefs.profile_orbs {
@@ -339,6 +350,7 @@ impl AgSwitchView {
             engine,
             rt,
             shared_snap,
+            shared_update,
             ui_prefs_path,
             is_sandbox,
             on_close_notify: Some(Box::new(on_close)),
@@ -347,6 +359,7 @@ impl AgSwitchView {
             page: initial_page,
             selected_profile_id: None,
             snapshot: initial_snap,
+            update_state: initial_update,
             audits: Vec::new(),
             in_flight_phase: None,
             toast_line: None,
@@ -423,6 +436,11 @@ impl AgSwitchView {
                     if let Ok(CommandResponse::AuditLog(entries)) = result.1 {
                         v.audits = entries;
                     }
+                    if let Ok(guard) = v.shared_update.lock()
+                        && v.update_state != *guard
+                    {
+                        v.update_state = guard.clone();
+                    }
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -471,6 +489,46 @@ impl AgSwitchView {
             (FULL_POPOVER_W, FULL_POPOVER_H)
         };
         window.resize(size(px(w), px(h)));
+    }
+
+    fn trigger_update_check(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.update_state, UpdateCheckState::Checking) {
+            return;
+        }
+        self.update_state = UpdateCheckState::Checking;
+        if let Ok(mut guard) = self.shared_update.lock() {
+            *guard = UpdateCheckState::Checking;
+        }
+        self.toast_line = Some("Checking GitHub releases…".to_owned());
+        cx.notify();
+
+        let shared_update = self.shared_update.clone();
+        cx.spawn(async move |this, cx| {
+            let state = cx
+                .background_executor()
+                .spawn(async move { check_latest_github_release(env!("CARGO_PKG_VERSION")) })
+                .await;
+            if let Ok(mut guard) = shared_update.lock() {
+                *guard = state.clone();
+            }
+            let _ = this.update(cx, |v, cx| {
+                v.toast_line = Some(match &state {
+                    UpdateCheckState::UpdateAvailable(rel) => {
+                        format!("Update {} available on GitHub", rel.tag_name)
+                    }
+                    UpdateCheckState::UpToDate { latest_tag } => {
+                        format!("Up to date (latest {latest_tag})")
+                    }
+                    UpdateCheckState::Unavailable => "Could not reach GitHub Releases".to_owned(),
+                    UpdateCheckState::Idle | UpdateCheckState::Checking => {
+                        "Checked GitHub Releases".to_owned()
+                    }
+                });
+                v.update_state = state;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn navigate_to(&mut self, page: PopoverPage, window: &mut Window, cx: &mut Context<Self>) {
@@ -909,6 +967,52 @@ impl AgSwitchView {
             .flex()
             .items_center()
             .gap(px(6.0));
+
+        if show_add_btn
+            && let UpdateCheckState::UpdateAvailable(rel) = &self.update_state
+        {
+            let tag = rel.tag_name.clone();
+            let url = rel.html_url.clone();
+            let label = if is_compact_overview {
+                "↑".to_owned()
+            } else {
+                format!("↑ {tag}")
+            };
+            right_bar = right_bar.child(
+                div()
+                    .id("hdr-update-release")
+                    .h(px(26.0))
+                    .px(px(if is_compact_overview { 8.0 } else { 9.5 }))
+                    .rounded(px(999.0))
+                    .bg(if p.is_light {
+                        rgba(0x0596_691E)
+                    } else {
+                        rgba(0x34D3_9922)
+                    })
+                    .border_1()
+                    .border_color(if p.is_light {
+                        rgba(0x0596_6966)
+                    } else {
+                        rgba(0x34D3_9977)
+                    })
+                    .text_color(p.status_ok)
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(p.status_ok))
+                    .on_click(cx.listener(move |v, _, _, cx| {
+                        v.toast_line = Some(match open_url_in_browser(&url) {
+                            Ok(()) => format!("Opened {tag} release ↗"),
+                            Err(e) => e.to_string(),
+                        });
+                        cx.notify();
+                    }))
+                    .child(label),
+            );
+        }
 
         if show_add_btn {
             right_bar = right_bar.child(
@@ -3377,23 +3481,68 @@ impl AgSwitchView {
         let hide_emails = self.hide_emails;
         let profiles_dir = snap.map(|s| s.profiles_root_dir.clone());
 
+        let current_version = env!("CARGO_PKG_VERSION");
+        let os_badge = match RuntimeOs::current() {
+            RuntimeOs::MacOs => "macOS",
+            RuntimeOs::Windows => "Windows",
+            RuntimeOs::Linux => "Linux",
+        };
+        let is_checking_update = matches!(self.update_state, UpdateCheckState::Checking);
+        let (update_summary, update_is_avail, release_target_url, release_btn_label) =
+            match &self.update_state {
+                UpdateCheckState::UpdateAvailable(rel) => (
+                    format!("New release {} available on GitHub", rel.tag_name),
+                    true,
+                    rel.html_url.clone(),
+                    format!("Update {} ↗", rel.tag_name),
+                ),
+                UpdateCheckState::UpToDate { latest_tag } => (
+                    format!("Up to date · GitHub latest {latest_tag}"),
+                    false,
+                    GITHUB_RELEASES_PAGE_URL.to_owned(),
+                    "Releases ↗".to_owned(),
+                ),
+                UpdateCheckState::Checking => (
+                    "Checking KJ-AIML/agy-swap releases…".to_owned(),
+                    false,
+                    GITHUB_RELEASES_PAGE_URL.to_owned(),
+                    "Releases ↗".to_owned(),
+                ),
+                UpdateCheckState::Unavailable => (
+                    "Could not reach GitHub Releases".to_owned(),
+                    false,
+                    GITHUB_RELEASES_PAGE_URL.to_owned(),
+                    "Releases ↗".to_owned(),
+                ),
+                UpdateCheckState::Idle => (
+                    if self.is_sandbox {
+                        "Sandbox mode · click Check to query GitHub".to_owned()
+                    } else {
+                        "Tracks github.com/KJ-AIML/agy-swap releases".to_owned()
+                    },
+                    false,
+                    GITHUB_RELEASES_PAGE_URL.to_owned(),
+                    "Releases ↗".to_owned(),
+                ),
+            };
+
         let left_col = div()
             .flex_1()
             .min_w_0()
             .flex()
             .flex_col()
-            .gap(px(14.0))
+            .gap(px(11.0))
             // Appearance: Dark / Light
             .child(
                 div()
-                    .p(px(14.0))
+                    .p(px(12.5))
                     .rounded(px(12.0))
                     .bg(p.card_bg)
                     .border_1()
                     .border_color(p.border_hairline)
                     .flex()
                     .flex_col()
-                    .gap(px(10.0))
+                    .gap(px(9.0))
                     .child(
                         div()
                             .flex()
@@ -3487,14 +3636,14 @@ impl AgSwitchView {
             // Layout Mode: Full (Split 2-Col) vs Compact (Switcher Only)
             .child(
                 div()
-                    .p(px(14.0))
+                    .p(px(12.5))
                     .rounded(px(12.0))
                     .bg(p.card_bg)
                     .border_1()
                     .border_color(p.border_hairline)
                     .flex()
                     .flex_col()
-                    .gap(px(10.0))
+                    .gap(px(9.0))
                     .child(
                         div()
                             .flex()
@@ -3582,6 +3731,150 @@ impl AgSwitchView {
                                         v.navigate_to(PopoverPage::SplitOverview, window, cx);
                                     }))
                                     .child("Compact (Mini)"),
+                            ),
+                    ),
+            )
+            // Version & GitHub Release Updates
+            .child(
+                div()
+                    .p(px(12.5))
+                    .rounded(px(12.0))
+                    .bg(p.card_bg)
+                    .border_1()
+                    .border_color(if update_is_avail {
+                        p.status_ok
+                    } else {
+                        p.border_hairline
+                    })
+                    .flex()
+                    .flex_col()
+                    .gap(px(9.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(p.text_muted)
+                                    .child("VERSION & UPDATES"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .child(
+                                        div()
+                                            .px(px(6.5))
+                                            .py(px(1.5))
+                                            .rounded(px(5.0))
+                                            .bg(p.btn_dark)
+                                            .border_1()
+                                            .border_color(p.border_subtle)
+                                            .text_size(px(10.0))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(p.text_primary)
+                                            .child(format!("v{current_version}")),
+                                    )
+                                    .child(
+                                        div()
+                                            .px(px(5.5))
+                                            .py(px(1.5))
+                                            .rounded(px(5.0))
+                                            .bg(p.btn_dark)
+                                            .text_size(px(9.5))
+                                            .text_color(p.text_muted)
+                                            .child(os_badge),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(if update_is_avail {
+                                p.status_ok
+                            } else {
+                                p.text_secondary
+                            })
+                            .child(update_summary),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .id("set-check-update")
+                                    .flex_1()
+                                    .h(px(32.0))
+                                    .rounded(px(8.0))
+                                    .bg(p.btn_dark)
+                                    .border_1()
+                                    .border_color(p.border_subtle)
+                                    .text_size(px(11.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(p.text_primary)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .hover(|s| s.border_color(p.border_outer))
+                                    .on_click(cx.listener(|v, _, _, cx| {
+                                        v.trigger_update_check(cx);
+                                    }))
+                                    .child(if is_checking_update {
+                                        "Checking…"
+                                    } else {
+                                        "Check Updates"
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("set-open-release")
+                                    .flex_1()
+                                    .h(px(32.0))
+                                    .rounded(px(8.0))
+                                    .bg(if update_is_avail {
+                                        if p.is_light {
+                                            rgba(0x0596_691E).into()
+                                        } else {
+                                            rgba(0x34D3_9922).into()
+                                        }
+                                    } else {
+                                        p.btn_dark
+                                    })
+                                    .border_1()
+                                    .border_color(if update_is_avail {
+                                        p.status_ok
+                                    } else {
+                                        p.border_subtle
+                                    })
+                                    .text_size(px(11.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(if update_is_avail {
+                                        p.status_ok
+                                    } else {
+                                        p.text_primary
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .hover(|s| s.border_color(p.border_outer))
+                                    .on_click(cx.listener(move |v, _, _, cx| {
+                                        v.toast_line = Some(
+                                            match open_url_in_browser(&release_target_url) {
+                                                Ok(()) => "Opened GitHub Releases ↗".to_owned(),
+                                                Err(e) => e.to_string(),
+                                            },
+                                        );
+                                        cx.notify();
+                                    }))
+                                    .child(release_btn_label),
                             ),
                     ),
             );

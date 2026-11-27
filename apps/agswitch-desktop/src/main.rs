@@ -14,11 +14,13 @@ use std::time::{Duration, Instant};
 use agswitch_engine::{Engine, EngineDefaults, ProcessPort, TranscriptPort};
 use agswitch_integrations::{
     OsProcessAdapter, OsTranscriptAdapter, OsWorkspaceLinkAdapter, SystemClockAdapter,
-    default_antigravity_bin_path, default_data_dir, default_profiles_root_dir,
-    open_directory_in_file_manager, primary_home_dir, sandbox,
+    check_latest_github_release, default_antigravity_bin_path, default_data_dir,
+    default_profiles_root_dir, open_directory_in_file_manager, primary_home_dir, sandbox,
 };
 use agswitch_primitives::RuntimeOs;
-use agswitch_spec::{CallerContext, CommandRequest, CommandResponse, DashboardSnapshot};
+use agswitch_spec::{
+    CallerContext, CommandRequest, CommandResponse, DashboardSnapshot, UpdateCheckState,
+};
 use agswitch_store::JsonFileStore;
 use gpui::{
     App, AppContext, Application, Bounds, WindowBackgroundAppearance, WindowBounds, WindowHandle,
@@ -110,6 +112,8 @@ fn main() -> ExitCode {
 
     let ui_prefs_path = data_dir.join("ui-prefs.json");
     let shared_snap: Arc<Mutex<Option<DashboardSnapshot>>> = Arc::new(Mutex::new(None));
+    let shared_update: Arc<Mutex<UpdateCheckState>> =
+        Arc::new(Mutex::new(UpdateCheckState::Idle));
 
     Application::new().run(move |cx: &mut App| {
         // Initialize top Menu Bar (macOS) / System Tray (Windows) icon on main UI thread
@@ -132,6 +136,7 @@ fn main() -> ExitCode {
             engine.clone(),
             rt.clone(),
             shared_snap.clone(),
+            shared_update.clone(),
             ui_prefs_path.clone(),
             is_sandbox,
             demo_page.clone(),
@@ -143,16 +148,36 @@ fn main() -> ExitCode {
         let engine_loop = engine.clone();
         let rt_loop = rt.clone();
         let snap_loop = shared_snap.clone();
+        let update_loop = shared_update.clone();
         let profiles_dir_loop = profiles_root.clone();
         let prefs_loop = ui_prefs_path.clone();
 
         cx.spawn(async move |cx| {
             let mut ticks: u32 = 0;
+            let mut last_update_check: Option<Instant> = None;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(65))
                     .await;
                 ticks = ticks.wrapping_add(1);
+
+                // Quietly check GitHub Releases once ~2s after startup and every 30 min (skipped in sandbox)
+                let should_check_update = !is_sandbox
+                    && ticks >= 30
+                    && last_update_check
+                        .is_none_or(|prev| prev.elapsed() >= Duration::from_secs(1800));
+                if should_check_update {
+                    last_update_check = Some(Instant::now());
+                    let upd_bg = update_loop.clone();
+                    cx.background_executor()
+                        .spawn(async move {
+                            let state = check_latest_github_release(env!("CARGO_PKG_VERSION"));
+                            if let Ok(mut guard) = upd_bg.lock() {
+                                *guard = state;
+                            }
+                        })
+                        .detach();
+                }
 
                 // Every ~2s sync the native tray menu tooltip & items with latest snapshot
                 if ticks.is_multiple_of(30) {
@@ -201,6 +226,7 @@ fn main() -> ExitCode {
                                     engine_loop.clone(),
                                     rt_loop.clone(),
                                     snap_loop.clone(),
+                                    update_loop.clone(),
                                     prefs_loop.clone(),
                                     is_sandbox,
                                 );
@@ -258,6 +284,7 @@ fn toggle_popover(
     engine: Arc<Engine>,
     rt: Arc<tokio::runtime::Runtime>,
     shared_snap: Arc<Mutex<Option<DashboardSnapshot>>>,
+    shared_update: Arc<Mutex<UpdateCheckState>>,
     ui_prefs_path: PathBuf,
     is_sandbox: bool,
 ) {
@@ -283,6 +310,7 @@ fn toggle_popover(
         engine,
         rt,
         shared_snap,
+        shared_update,
         ui_prefs_path,
         is_sandbox,
         None,
@@ -297,6 +325,7 @@ fn open_popover(
     engine: Arc<Engine>,
     rt: Arc<tokio::runtime::Runtime>,
     shared_snap: Arc<Mutex<Option<DashboardSnapshot>>>,
+    shared_update: Arc<Mutex<UpdateCheckState>>,
     ui_prefs_path: PathBuf,
     is_sandbox: bool,
     demo_page: Option<String>,
@@ -330,6 +359,7 @@ fn open_popover(
                 engine,
                 rt,
                 shared_snap,
+                shared_update,
                 ui_prefs_path,
                 is_sandbox,
                 demo_page,

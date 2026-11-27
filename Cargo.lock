@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "agswitch-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agswitch-domain",
  "agswitch-engine",
@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "agswitch-desktop"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agswitch-domain",
  "agswitch-engine",
@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "agswitch-domain"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agswitch-primitives",
  "agswitch-spec",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "agswitch-engine"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agswitch-domain",
  "agswitch-primitives",
@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "agswitch-integrations"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agswitch-engine",
  "agswitch-primitives",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "agswitch-primitives"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "serde",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "agswitch-spec"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agswitch-primitives",
  "chrono",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "agswitch-store"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agswitch-domain",
  "agswitch-primitives",
@@ -7320,7 +7320,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "cargo_metadata",
 ]

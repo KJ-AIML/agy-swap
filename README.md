@@ -103,7 +103,7 @@ Pre-built downloads are published on [GitHub Releases](https://github.com/KJ-AIM
 
 Requires macOS 13+ (Apple Silicon tested), Xcode Command Line Tools (`xcode-select --install`), and [rustup](https://rustup.rs) (toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml)).
 
-**Pre-built:** download `AGY-Swap-v0.1.2-macos-arm64.dmg` (and optional `agswitch-cli-v0.1.2-macos-arm64.tar.gz`) from [GitHub Releases](https://github.com/KJ-AIML/agy-swap/releases), verify against `SHA256SUMS-macos-arm64.txt`, and drag **AGY Swap** into `/Applications`.
+**Pre-built:** download `AGY-Swap-v0.1.3-macos-arm64.dmg` (and optional `agswitch-cli-v0.1.3-macos-arm64.tar.gz`) from [GitHub Releases](https://github.com/KJ-AIML/agy-swap/releases), verify against `SHA256SUMS-macos-arm64.txt`, and drag **AGY Swap** into `/Applications`.
 
 **From source:**
 ```sh

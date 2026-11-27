@@ -3,11 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use agswitch_primitives::{AccountTier, AppError, ModelFamily, RuleId, RuntimeOs};
 use agswitch_spec::{
     AccountProfile, AccountUsageMetrics, ActiveSessionSpan, LaunchSpec, ModelUsageBreakdown,
-    RuleStatus, SingleModelUsage, TranscriptFeed, TranscriptStep, UsageLedger, UsageSnapshot,
+    ReleaseInfo, RuleStatus, SingleModelUsage, TranscriptFeed, TranscriptStep, UpdateCheckState,
+    UsageLedger, UsageSnapshot,
 };
 use chrono::{DateTime, Duration, Utc};
 
 pub const MOCK_SSH_CONNECTION: &str = "127.0.0.1 1234 127.0.0.1 22";
+pub const GITHUB_REPO_PREFIX: &str = "https://github.com/KJ-AIML/agy-swap/";
 pub const CONTEXT_SOFT_BUDGET: u64 = 1_000_000;
 pub const COOLDOWN_HOURS: i64 = 5;
 pub const ACCENT_PALETTE: [&str; 6] = [
@@ -905,6 +907,132 @@ pub fn format_tokens(n: u64) -> String {
     }
 }
 
+/// Parse a `major.minor.patch` SemVer triplet (accepts optional leading `v`/`V` and strips `-pre`/`+meta`).
+pub fn parse_semver_triplet(raw: &str) -> Option<(u64, u64, u64)> {
+    let trimmed = raw.trim();
+    let no_v = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    let core = no_v.split(['-', '+']).next()?.trim();
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Returns `true` strictly when `latest_tag` represents a newer SemVer release than `current_version`.
+pub fn is_newer_release(current_version: &str, latest_tag: &str) -> bool {
+    match (
+        parse_semver_triplet(current_version),
+        parse_semver_triplet(latest_tag),
+    ) {
+        (Some(cur), Some(latest)) => latest > cur,
+        _ => false,
+    }
+}
+
+fn release_matches_platform(item: &serde_json::Value, os: RuntimeOs) -> bool {
+    let Some(assets) = item.get("assets").and_then(serde_json::Value::as_array) else {
+        return true;
+    };
+    if assets.is_empty() {
+        return true;
+    }
+    assets.iter().any(|asset| {
+        let name = asset
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match os {
+            RuntimeOs::MacOs => name.contains("macos") || name.ends_with(".dmg"),
+            RuntimeOs::Windows => {
+                name.contains("windows") || name.ends_with(".zip") || name.ends_with(".exe")
+            }
+            RuntimeOs::Linux => name.contains("linux") || name.ends_with(".appimage"),
+        }
+    })
+}
+
+/// Parse GitHub Releases API JSON (single object or array) into an `UpdateCheckState` for `os`.
+/// Ignores draft/prerelease entries, validates that `html_url` belongs to `KJ-AIML/agy-swap`,
+/// and filters out releases whose binary assets belong exclusively to another OS.
+pub fn parse_github_releases_json(
+    body: &str,
+    current_version: &str,
+    os: RuntimeOs,
+) -> Option<UpdateCheckState> {
+    let val: serde_json::Value = serde_json::from_str(body).ok()?;
+    let items: Vec<&serde_json::Value> = if let Some(arr) = val.as_array() {
+        arr.iter().collect()
+    } else if val.is_object() {
+        vec![&val]
+    } else {
+        return None;
+    };
+
+    let mut best: Option<((u64, u64, u64), ReleaseInfo)> = None;
+    for item in items {
+        if item
+            .get("draft")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || item
+                .get("prerelease")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        if !release_matches_platform(item, os) {
+            continue;
+        }
+        let Some(tag_name) = item
+            .get("tag_name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let Some(html_url) = item
+            .get("html_url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|u| u.starts_with(GITHUB_REPO_PREFIX))
+        else {
+            continue;
+        };
+        let Some(ver) = parse_semver_triplet(tag_name) else {
+            continue;
+        };
+
+        if best.as_ref().is_none_or(|(prev, _)| ver > *prev) {
+            best = Some((
+                ver,
+                ReleaseInfo {
+                    tag_name: tag_name.to_owned(),
+                    html_url: html_url.to_owned(),
+                },
+            ));
+        }
+    }
+
+    let (_, latest) = best?;
+    if is_newer_release(current_version, &latest.tag_name) {
+        Some(UpdateCheckState::UpdateAvailable(latest))
+    } else {
+        Some(UpdateCheckState::UpToDate {
+            latest_tag: latest.tag_name,
+        })
+    }
+}
+
 /// Build the static list of enforced rules `R1..R5` for UI transparency.
 pub fn enforced_rules_status() -> Vec<RuleStatus> {
     RuleId::all()
@@ -1202,6 +1330,69 @@ mod tests {
             res,
             Err(AppError::PolicyBlocked { rule: RuleId::R1, .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn semver_and_github_releases_parser_filter_platform_and_validate_url() -> Result<(), String> {
+        assert!(is_newer_release("0.1.3", "v0.1.4"));
+        assert!(is_newer_release("0.1.9", "v0.1.10"));
+        assert!(is_newer_release("0.1.3", "v0.2.0"));
+        assert!(!is_newer_release("0.1.3", "v0.1.3"));
+        assert!(!is_newer_release("0.1.3", "v0.1.2"));
+
+        let payload = r#"[
+            {
+                "tag_name": "v0.1.5",
+                "html_url": "https://github.com/KJ-AIML/agy-swap/releases/tag/v0.1.5",
+                "draft": true,
+                "prerelease": false,
+                "assets": [{"name": "AGY-Swap-v0.1.5-macos-arm64.dmg"}]
+            },
+            {
+                "tag_name": "v0.1.4",
+                "html_url": "https://github.com/KJ-AIML/agy-swap/releases/tag/v0.1.4",
+                "draft": false,
+                "prerelease": false,
+                "assets": [{"name": "AGY-Swap-v0.1.4-windows-x86_64.zip"}]
+            },
+            {
+                "tag_name": "v0.1.3",
+                "html_url": "https://github.com/KJ-AIML/agy-swap/releases/tag/v0.1.3",
+                "draft": false,
+                "prerelease": false,
+                "assets": [{"name": "AGY-Swap-v0.1.3-macos-arm64.dmg"}]
+            }
+        ]"#;
+
+        // Windows-only v0.1.4 must notify Windows 0.1.3, but NOT nag macOS 0.1.3
+        let win_state = parse_github_releases_json(payload, "0.1.3", RuntimeOs::Windows)
+            .ok_or_else(|| "expected Windows state".to_owned())?;
+        assert!(matches!(
+            win_state,
+            UpdateCheckState::UpdateAvailable(ref rel) if rel.tag_name == "v0.1.4"
+        ));
+
+        let mac_state = parse_github_releases_json(payload, "0.1.3", RuntimeOs::MacOs)
+            .ok_or_else(|| "expected macOS state".to_owned())?;
+        assert_eq!(
+            mac_state,
+            UpdateCheckState::UpToDate {
+                latest_tag: "v0.1.3".to_owned()
+            }
+        );
+
+        // macOS 0.1.2 sees macOS v0.1.3 as an available update
+        let mac_old = parse_github_releases_json(payload, "0.1.2", RuntimeOs::MacOs)
+            .ok_or_else(|| "expected macOS update".to_owned())?;
+        assert!(matches!(
+            mac_old,
+            UpdateCheckState::UpdateAvailable(ref rel) if rel.tag_name == "v0.1.3"
+        ));
+
+        // Untrusted URL outside KJ-AIML/agy-swap must be rejected
+        let hostile = r#"{"tag_name":"v9.9.9","html_url":"https://evil.example/payload","draft":false,"prerelease":false,"assets":[]}"#;
+        assert!(parse_github_releases_json(hostile, "0.1.3", RuntimeOs::MacOs).is_none());
         Ok(())
     }
 }

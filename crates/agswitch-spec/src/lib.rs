@@ -512,3 +512,25 @@ pub enum CommandResponse {
     },
     AuditLog(Vec<AuditEntry>),
 }
+
+/// Metadata for a newer GitHub Release published for AGY Swap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseInfo {
+    /// Release tag name (e.g. `v0.1.4`).
+    pub tag_name: String,
+    /// Validated GitHub Release page URL.
+    pub html_url: String,
+}
+
+/// Non-blocking GitHub Release update status tracked in the desktop UI.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum UpdateCheckState {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate {
+        latest_tag: String,
+    },
+    UpdateAvailable(ReleaseInfo),
+    Unavailable,
+}

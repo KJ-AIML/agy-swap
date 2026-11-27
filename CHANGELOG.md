@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.3] — macOS Account Isolation Fix & GitHub Release Update Checker
+
+### macOS
+- **Fix cross-account login leakage (`Library/Keychains`)**: Removed the `<profile>/Library/Keychains -> ~/Library/Keychains` symlink introduced in `v0.1.2` (which caused Antigravity's `language_server` to share the primary OS `login.keychain-db` across isolated accounts) while keeping LaunchServices (`open -n -a`, `PPID = 1`) intact so Microphone / Voice mode and TCC permissions continue working cleanly across every account.
+- **Automatic cleanup of `v0.1.2` symlinks**: `ensure_os_runtime_links()` safely unlinks any legacy `v0.1.2` `<profile>/Library/Keychains` symlink pointing to `~/Library/Keychains` before launch (Rule R1 safe — never touches real directories or the primary Keychain).
+- **Live macOS LaunchServices E2E test**: Added `scripts/test-macos-launch.sh` to verify `PPID = 1`, isolated `HOME`/`--user-data-dir`, and Keychain isolation using a throwaway mock `.app` bundle without touching a live Antigravity session.
+
+### Desktop App (macOS & Windows)
+- **Settings → Version & Updates**: Displays the running version (`v0.1.3` + OS badge), live GitHub Release status, a manual **Check Updates** action, and a **Releases ↗** / **Update ↗** shortcut.
+- **Header update pill next to `+ Add Gmail`**: Automatically surfaces a subtle `↑ vX.Y.Z` button (`↑` in Compact mode) whenever a newer platform-compatible release is published on `KJ-AIML/agy-swap`, filtering out releases whose assets target another OS and validating GitHub release URLs.
+
+### Release Artifacts
+- **macOS (Apple Silicon / arm64):**
+  - `AGY-Swap-v0.1.3-macos-arm64.dmg` (`sha256: 125dfec14ead0d659eea29a74c4b6e6305b0e1dd66c25aa6237a8ee57f088aaf`)
+  - `agswitch-cli-v0.1.3-macos-arm64.tar.gz` (`sha256: a323e4681f3ae8b32cf10b9892fa141c192c44cc4eee01c7b186060109b9ddc3`)
+  - `SHA256SUMS-macos-arm64.txt`
+- **Windows 10/11 (x86_64):** build from source for the `v0.1.3` update checker UI, or use `v0.1.1` pre-built zip until the next Windows zip build is uploaded.
+
 ## [0.1.2] — macOS LaunchServices (Microphone / TCC) & Keychain Fix
 
 ### macOS
